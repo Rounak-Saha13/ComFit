@@ -46,7 +46,6 @@ export async function signup(formData: FormData) {
   const email = formData.get("email") as string;
   const password = formData.get("password") as string;
   const fullName = formData.get("fullName") as string;
-  const phone = formData.get("phone") as string | undefined;
   //const captchaToken = formData.get("captchaToken") as string;
 
   /*
@@ -57,10 +56,15 @@ export async function signup(formData: FormData) {
   });
   */
 
-  const { error } = await supabase.auth.signUp({
+  const { data, error } = await supabase.auth.signUp({
     email,
     password,
-    options: { data: { fullName, phone } },
+    options: {
+      data: {
+        full_name: fullName, // Use full_name to match the trigger function
+        fullName: fullName, // Keep both for compatibility
+      },
+    },
   });
 
   if (error) {
@@ -75,6 +79,28 @@ export async function signup(formData: FormData) {
       msg = error.message;
     }
     redirect(`/auth/login?error=${encodeURIComponent(msg)}`);
+  }
+
+  // If user was created successfully, ensure profile exists
+  if (data.user) {
+    try {
+      // Try to insert profile if it doesn't exist (fallback in case trigger fails)
+      const { error: profileError } = await supabase.from("profiles").upsert(
+        {
+          id: data.user.id,
+          full_name: fullName,
+        },
+        {
+          onConflict: "id",
+        }
+      );
+
+      if (profileError) {
+        console.error("Profile creation error:", profileError);
+      }
+    } catch (profileErr) {
+      console.error("Profile creation failed:", profileErr);
+    }
   }
 
   revalidatePath("/", "layout");

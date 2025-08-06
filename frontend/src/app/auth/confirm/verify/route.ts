@@ -12,12 +12,35 @@ export async function GET(request: NextRequest) {
 
   if (token_hash && type) {
     const supabase = await createClient();
-    const { error } = await supabase.auth.verifyOtp({
+    const { data, error } = await supabase.auth.verifyOtp({
       type,
       token_hash,
     });
 
-    if (!error) {
+    if (!error && data.user) {
+      // Ensure profile exists after email confirmation
+      try {
+        const fullName =
+          data.user.user_metadata?.full_name ||
+          data.user.user_metadata?.fullName ||
+          "Anonymous";
+
+        await supabase.from("profiles").upsert(
+          {
+            id: data.user.id,
+            full_name: fullName,
+          },
+          {
+            onConflict: "id",
+          }
+        );
+      } catch (profileError) {
+        console.error(
+          "Profile creation error during verification:",
+          profileError
+        );
+      }
+
       // for password reset
       if (type === "recovery") {
         redirect("/auth/reset-password");

@@ -9,6 +9,7 @@ interface ManageProfileProps {
   isOpen: boolean;
   onClose: () => void;
   user: {
+    id?: string;
     email?: string | null;
     user_metadata?: {
       full_name?: string;
@@ -108,6 +109,7 @@ export default function ManageProfile({
         if (signinErr) throw signinErr;
       }
 
+      // Update auth user data
       const updatePayload: any = {
         data: {
           full_name: fullName,
@@ -127,6 +129,20 @@ export default function ManageProfile({
       );
       if (updateErr) throw updateErr;
 
+      // Also update the profiles table
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .update({
+          full_name: fullName,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", user.id);
+
+      if (profileError) {
+        console.error("Profile update error:", profileError);
+        // Don't throw here as auth update was successful
+      }
+
       onClose();
     } catch (err: any) {
       setError(err.message || "Failed to update profile");
@@ -136,8 +152,8 @@ export default function ManageProfile({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black">
-      <div className="bg-card rounded-lg shadow-lg w-full max-w-md mx-4 p-6">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="bg-gray-800 rounded-lg shadow-lg w-full max-w-md mx-4 p-6">
         <h1 className="text-lg font-semibold text-foreground pb-4">
           Modify Profile
         </h1>

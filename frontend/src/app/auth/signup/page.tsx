@@ -165,31 +165,6 @@ function SignupPageContent() {
                     </div>
                   </div>
 
-                  {/* Phone */}
-                  <div className="space-y-2">
-                    <label
-                      htmlFor="phone"
-                      className="block text-sm font-medium text-gray-300"
-                    >
-                      Phone{" "}
-                      <span className="text-gray-500 font-normal">
-                        (optional)
-                      </span>
-                    </label>
-                    <div className="relative">
-                      <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                        <Phone className="h-5 w-5 text-gray-500" />
-                      </div>
-                      <input
-                        id="phone"
-                        name="phone"
-                        type="tel"
-                        className="w-full bg-gray-700 border border-gray-600 text-white pl-10 px-4 py-3 rounded-md focus:outline-none focus:ring-2 focus:ring-primary focus:border-primary transition-colors"
-                        placeholder="Enter your phone number"
-                      />
-                    </div>
-                  </div>
-
                   {/* Email */}
                   <div className="space-y-2">
                     <label

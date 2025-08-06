@@ -1,6 +1,6 @@
 "use client";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 // imports
 import { SetStateAction, useEffect, useRef, useState } from "react";
 import {
@@ -23,6 +23,13 @@ import {
   User as UserIcon,
   Mic,
   ChevronRight,
+  Paperclip,
+  Brain,
+  VectorSquare,
+  Globe,
+  MessageSquare,
+  Database,
+  HelpCircle,
 } from "lucide-react";
 
 import {
@@ -97,6 +104,8 @@ export default function ChatbotUI() {
   const [openAccordions, setOpenAccordions] = useState<string[]>([]);
   const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
+  const [mechanisticInterpretability, setMechanisticInterpretability] =
+    useState(false);
 
   // states for enhanced Plus dropdown and active features
   const [showPlusDropdown, setShowPlusDropdown] = useState(false);
@@ -108,6 +117,9 @@ export default function ChatbotUI() {
   const [editingText, setEditingText] = useState<string>("");
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // Engine type toggle state
+  const [engineType, setEngineType] = useState<"chat" | "query">("chat");
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const currentMessages = history[currentIndex]?.messages || [];
@@ -142,13 +154,19 @@ export default function ChatbotUI() {
   const [isRegenerating, setIsRegenerating] = useState(false);
 
   // states for model selection
-  const [selectedModel, setSelectedModel] = useState(
-    "hf.co/JatinkInnovision/DeKCIB_reasoning_v1:Q4_K_M"
-  );
+  const [selectedModel, setSelectedModel] = useState("gemma3:latest");
   const [models, setModels] = useState<string[]>([]);
+
+  // states for RAG and retrieval methods
+  const [selectedRagMethod, setSelectedRagMethod] = useState(
+    "No Specific RAG Method"
+  );
+  const [selectedRetrievalMethod, setSelectedRetrievalMethod] =
+    useState("local context only");
+
   // right sidebar controls
   const [systemPrompt, setSystemPrompt] = useState(
-    "You are a helpful AI assistant for biomechanics and injury"
+    "You are a helpful AI assistant for comfort and fitting clothing"
   );
   const [temperature, setTemperature] = useState(0.7);
   const [topP, setTopP] = useState(0.9);
@@ -159,14 +177,39 @@ export default function ChatbotUI() {
   // manage profile modal
   const [showProfileModal, setShowProfileModal] = useState(false);
 
-  // AI thinking time
-  const [thinkingTime, setThinkingTime] = useState<number | null>(null);
+  // AI thinking time - removed unused state variable
 
   const openProfileModal = () => {
     setShowUserMenu(false);
     setShowProfileModal(true);
   };
   const closeProfileModal = () => setShowProfileModal(false);
+
+  // Responsive sidebar behavior
+  useEffect(() => {
+    const handleResize = () => {
+      const isSmallScreen = window.innerWidth < 768; // md breakpoint
+      const isMediumScreen = window.innerWidth < 1024; // lg breakpoint
+
+      if (isSmallScreen) {
+        // On small screens, close both sidebars
+        setShowLeftSidebar(false);
+        setShowRightSidebar(false);
+      } else if (isMediumScreen) {
+        // On medium screens, close right sidebar but keep left sidebar
+        setShowRightSidebar(false);
+      }
+    };
+
+    // Set initial state based on current screen size
+    handleResize();
+
+    // Add event listener
+    window.addEventListener("resize", handleResize);
+
+    // Cleanup
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   // hook for session
   useEffect(() => {
@@ -267,6 +310,61 @@ export default function ChatbotUI() {
           )
         );
         setCurrentIndex(Math.max(0, newIndex));
+
+        // Load the current conversation's history if it exists
+        if (data.length > 0 && newIndex >= 0) {
+          const currentConversation = data[newIndex];
+          try {
+            const {
+              messages,
+              branchesByEditId = {},
+              currentBranchIndexByEditId = {},
+            } = await loadHistory(currentConversation.id);
+
+            // Convert backend field names to frontend field names
+            const convertedMessages = messages.map((msg: any) => {
+              const converted = {
+                ...msg,
+                thinkingTime: msg.thinking_time,
+              };
+              if (msg.sender === "ai") {
+                console.log("DEBUG: Loading AI message from backend:", {
+                  id: msg.id,
+                  thinking_time: msg.thinking_time,
+                  thinkingTime: converted.thinkingTime,
+                });
+              }
+              return converted;
+            });
+
+            // Convert branch messages as well
+            const convertedBranchesByEditId: Record<string, BranchItem[]> = {};
+            for (const [editId, branches] of Object.entries(branchesByEditId)) {
+              convertedBranchesByEditId[editId] = branches.map(
+                (branch: any) => ({
+                  ...branch,
+                  messages: branch.messages.map((msg: any) => ({
+                    ...msg,
+                    thinkingTime: msg.thinking_time,
+                  })),
+                })
+              );
+            }
+
+            setHistory((prev) => {
+              const newHist = [...prev];
+              newHist[newIndex] = {
+                messages: convertedMessages,
+                originalMessages: convertedMessages,
+                branchesByEditId: convertedBranchesByEditId,
+                currentBranchIndexByEditId,
+              };
+              return newHist;
+            });
+          } catch (err) {
+            console.error("Error loading current conversation history:", err);
+          }
+        }
       } catch (err) {
         console.error("Error loading conversations:", err);
       } finally {
@@ -280,14 +378,28 @@ export default function ChatbotUI() {
   // fetch models list
   useEffect(() => {
     async function loadModels() {
+      console.log("DEBUG: Loading models from:", `${API_URL}/api/models`);
       try {
         const res = await fetch(`${API_URL}/api/models`);
-        if (!res.ok) throw new Error(await res.text());
-        const { models } = await res.json();
+        console.log("DEBUG: Models response status:", res.status);
+
+        if (!res.ok) {
+          const errorText = await res.text();
+          console.error("DEBUG: Models error response:", errorText);
+          throw new Error(errorText);
+        }
+
+        const data = await res.json();
+        console.log("DEBUG: Models response data:", data);
+        const { models } = data;
+        console.log("DEBUG: Available models:", models);
         setModels(models);
-        if (models.length > 0) setSelectedModel(models[0]);
+        if (models.length > 0) {
+          console.log("DEBUG: Setting initial model to:", models[0]);
+          setSelectedModel(models[0]);
+        }
       } catch (err) {
-        console.error("Error loading models:", err);
+        console.error("DEBUG: Error loading models:", err);
       }
     }
     loadModels();
@@ -333,6 +445,9 @@ export default function ChatbotUI() {
   };
 
   const handleRegenerate = async (aiMessageId: string) => {
+    // Set regenerating state for this specific message
+    setIsRegenerating(true);
+
     setHistory((prev) =>
       prev.map((convo, idx) =>
         idx === currentIndex
@@ -347,6 +462,11 @@ export default function ChatbotUI() {
           : convo
       )
     );
+
+    // Create abort controller for regeneration
+    const controller = new AbortController();
+    setAbortController(controller);
+    setIsAwaitingResponse(true);
 
     try {
       const {
@@ -375,7 +495,10 @@ export default function ChatbotUI() {
             model: selectedModel,
             preset,
             temperature,
+            rag_method: selectedRagMethod,
+            retrieval_method: selectedRetrievalMethod,
           }),
+          signal: controller.signal,
         }
       );
 
@@ -401,9 +524,39 @@ export default function ChatbotUI() {
         );
         return copy;
       });
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      if (err.name === "AbortError") {
+        // Handle cancellation
+        setHistory((prev) => {
+          const copy = [...prev];
+          copy[currentIndex].messages = copy[currentIndex].messages.map((m) =>
+            m.id === aiMessageId
+              ? { ...m, content: "Regeneration cancelled", isThinking: false }
+              : m
+          );
+          return copy;
+        });
+        return;
+      }
+      console.error("Regeneration error:", err);
+
+      // Restore original content on error
+      setHistory((prev) => {
+        const copy = [...prev];
+        copy[currentIndex].messages = copy[currentIndex].messages.map((m) =>
+          m.id === aiMessageId
+            ? {
+                ...m,
+                content: "Regeneration failed. Please try again.",
+                isThinking: false,
+              }
+            : m
+        );
+        return copy;
+      });
     } finally {
+      setIsRegenerating(false);
+      setAbortController(null);
       setIsAwaitingResponse(false);
     }
   };
@@ -454,12 +607,30 @@ export default function ChatbotUI() {
       currentBranchIndexByEditId = {},
     } = await loadHistory(convId);
 
+    // Convert backend field names to frontend field names
+    const convertedMessages = messages.map((msg: any) => ({
+      ...msg,
+      thinkingTime: msg.thinking_time,
+    }));
+
+    // Convert branch messages as well
+    const convertedBranchesByEditId: Record<string, BranchItem[]> = {};
+    for (const [editId, branches] of Object.entries(branchesByEditId)) {
+      convertedBranchesByEditId[editId] = branches.map((branch: any) => ({
+        ...branch,
+        messages: branch.messages.map((msg: any) => ({
+          ...msg,
+          thinkingTime: msg.thinking_time,
+        })),
+      }));
+    }
+
     setHistory((prev) => {
       const newHist = [...prev];
       newHist[idx] = {
-        messages,
-        originalMessages: messages,
-        branchesByEditId,
+        messages: convertedMessages,
+        originalMessages: convertedMessages,
+        branchesByEditId: convertedBranchesByEditId,
         currentBranchIndexByEditId,
       };
       return newHist;
@@ -488,6 +659,9 @@ export default function ChatbotUI() {
 
   // generate AI response using the selected model
   const generateAIResponse = async (messages: any[], model: string) => {
+    console.log("DEBUG: generateAIResponse called");
+    console.log("DEBUG: API_URL:", API_URL);
+
     const {
       data: { session },
     } = await supabase.auth.getSession();
@@ -508,6 +682,8 @@ export default function ChatbotUI() {
         temperature: temperature,
         top_p: topP,
         strategy: strategy,
+        rag_method: selectedRagMethod,
+        retrieval_method: selectedRetrievalMethod,
       })),
       system_prompt: systemPrompt,
       model: selectedModel,
@@ -516,23 +692,53 @@ export default function ChatbotUI() {
       speculative_decoding: specDecoding,
       strategy,
       preset,
+      rag_method: selectedRagMethod,
+      retrieval_method: selectedRetrievalMethod,
     };
+
+    console.log("DEBUG: Request payload:", payload);
+    console.log("DEBUG: Request URL:", `${API_URL}/api/chat`);
+    console.log("DEBUG: Selected model in generateAIResponse:", selectedModel);
+    console.log("DEBUG: Model parameter passed to generateAIResponse:", model);
 
     if (session?.access_token) {
       headers.Authorization = `Bearer ${session.access_token}`;
-    }
-    const response = await fetch(`${API_URL}/api/chat`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      console.error("Failed payload:", payload);
-      throw new Error("⚠️ Failed to generate AI response.");
+      console.log("DEBUG: Auth token present");
+    } else {
+      console.log("DEBUG: No auth token");
     }
 
-    return await response.json();
+    console.log("DEBUG: Request headers:", headers);
+
+    try {
+      const response = await fetch(`${API_URL}/api/chat`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+
+      console.log("DEBUG: Response status:", response.status);
+      console.log(
+        "DEBUG: Response headers:",
+        Object.fromEntries(response.headers.entries())
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("DEBUG: Response error text:", errorText);
+        console.error("DEBUG: Failed payload:", payload);
+        throw new Error(
+          `⚠️ Failed to generate AI response. Status: ${response.status}, Error: ${errorText}`
+        );
+      }
+
+      const responseData = await response.json();
+      console.log("DEBUG: Response data:", responseData);
+      return responseData;
+    } catch (error) {
+      console.error("DEBUG: Fetch error:", error);
+      throw error;
+    }
   };
 
   var limitReached = false;
@@ -577,11 +783,12 @@ export default function ChatbotUI() {
     setAbortController(controller);
     setIsAwaitingResponse(true);
 
-    const currentMessages = history[currentIndex]?.messages || [];
-
     // if its a branch
     if (currentBranchId) {
-      const messagesForAI = [...currentMessages, userMessage];
+      const messagesForAI = [
+        ...(history[currentIndex]?.messages || []),
+        userMessage,
+      ];
       const { result: aiResp, duration } = await generateAIResponse(
         messagesForAI,
         selectedModel
@@ -655,7 +862,7 @@ export default function ChatbotUI() {
     const payload = {
       conversation_id: conversationId,
       messages: [
-        ...currentMessages.map((m) => ({
+        ...(history[currentIndex]?.messages || []).map((m) => ({
           id: m.id,
           conversation_id: conversationId,
           sender: m.sender,
@@ -669,6 +876,8 @@ export default function ChatbotUI() {
           temperature,
           top_p: topP,
           strategy,
+          rag_method: selectedRagMethod,
+          retrieval_method: selectedRetrievalMethod,
         })),
         {
           id: userMessage.id,
@@ -684,12 +893,19 @@ export default function ChatbotUI() {
       speculative_decoding: specDecoding,
       strategy,
       preset,
+      rag_method: selectedRagMethod,
+      retrieval_method: selectedRetrievalMethod,
     };
 
     if (session?.access_token) {
       headers.Authorization = `Bearer ${session.access_token}`;
     }
     try {
+      console.log("DEBUG: Sending chat request to:", `${API_URL}/api/chat`);
+      console.log("DEBUG: Chat payload:", payload);
+      console.log("DEBUG: Selected model in payload:", payload.model);
+      console.log("DEBUG: Selected model state:", selectedModel);
+
       const res = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
         headers,
@@ -697,39 +913,66 @@ export default function ChatbotUI() {
         signal: controller.signal,
       });
 
+      console.log("DEBUG: Chat response status:", res.status);
+      console.log(
+        "DEBUG: Chat response headers:",
+        Object.fromEntries(res.headers.entries())
+      );
+
       // rate limit pop up
       if (res.status === 429) {
+        console.log("DEBUG: Rate limit reached");
         limitReached = true;
         setShowLimitModal(true);
         return;
       }
 
-      if (!res.ok) throw new Error(`Chat API error: ${res.statusText}`);
+      if (!res.ok) {
+        const errorText = await res.text();
+        console.error("DEBUG: Chat API error response:", errorText);
+        throw new Error(`Chat API error: ${res.status} - ${errorText}`);
+      }
 
-      const { result: aiText, duration, ai_message } = await res.json();
-      setThinkingTime(duration);
+      const responseData = await res.json();
+      console.log("DEBUG: Chat response data:", responseData);
+      const { result: aiText, duration, ai_message } = responseData;
+      console.log("DEBUG: AI message from response:", ai_message);
+      console.log(
+        "DEBUG: AI message thinking_time:",
+        ai_message?.thinking_time
+      );
+      console.log("DEBUG: Duration from response:", duration);
+      const newMessage = {
+        id: ai_message.id,
+        content: ai_message.content,
+        sender: "ai" as const,
+        thinkingTime: ai_message.thinking_time || duration, // Fallback to duration if thinking_time is not available
+      };
+      console.log("DEBUG: New message being added:", newMessage);
+
       setHistory((prev) => {
         const copy = [...prev];
         copy[currentIndex] = {
           ...copy[currentIndex],
-          messages: [
-            ...copy[currentIndex].messages,
-            {
-              id: ai_message.id,
-              content: ai_message.content,
-              sender: "ai",
-              thinkingTime: ai_message.thinking_time,
-            },
-          ],
+          messages: [...copy[currentIndex].messages, newMessage],
           editAtId: undefined,
         };
+        console.log(
+          "DEBUG: Updated history with new message:",
+          copy[currentIndex].messages
+        );
+        console.log(
+          "DEBUG: Last message thinking time:",
+          copy[currentIndex].messages[copy[currentIndex].messages.length - 1]
+            ?.thinkingTime
+        );
         return copy;
       });
 
       setIsAwaitingResponse(false);
 
       // title generation for first message
-      const wasFirst = currentMessages.length === 0;
+      const wasFirst = history[currentIndex]?.messages.length === 0;
       if (session?.access_token) {
         headers.Authorization = `Bearer ${session.access_token}`;
       }
@@ -1336,11 +1579,11 @@ export default function ChatbotUI() {
     >
       {/* Left Sidebar */}
       {showLeftSidebar && (
-        <div className="w-64 bg-sidebar border-r border-sidebar-border flex flex-col">
-          <div className="p-4 border-b border-sidebar-border">
-            <div className="flex items-center justify-between mb-4">
+        <div className="w-56 sm:w-64 bg-sidebar border-r border-sidebar-border flex flex-col">
+          <div className="p-3 sm:p-4 border-b border-sidebar-border">
+            <div className="flex items-center justify-between mb-3 sm:mb-4">
               <div className="flex items-center gap-2">
-                <div className="w-20 h-10 flex items-center justify-center">
+                <div className="w-16 sm:w-20 h-8 sm:h-10 flex items-center justify-center">
                   <Image
                     src="/Innovision-White-Text.svg"
                     alt="Logo"
@@ -1359,29 +1602,29 @@ export default function ChatbotUI() {
             </div>
             <button
               onClick={handleNewChat}
-              className="w-full flex items-center justify-start text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-2 rounded cursor-pointer transition-colors"
+              className="w-full flex items-center justify-start text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-2 rounded cursor-pointer transition-colors text-sm sm:text-base"
             >
               <Plus className="w-4 h-4 mr-2" />
               New chat
             </button>
             <button
               onClick={() => setShowSearchModal(true)}
-              className="w-full flex items-center justify-start text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-2 rounded mt-2 cursor-pointer transition-colors"
+              className="w-full flex items-center justify-start text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-2 rounded mt-2 cursor-pointer transition-colors text-sm sm:text-base"
             >
               <Search className="w-4 h-4 mr-2" />
               Search chats
             </button>
           </div>
 
-          <div className="flex-1 p-4 overflow-y-auto sidebar-scrollbar">
+          <div className="flex-1 p-3 sm:p-4 overflow-y-auto sidebar-scrollbar">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-sm text-sidebar-foreground">
+              <span className="text-xs sm:text-sm text-sidebar-foreground">
                 Recent Conversations
               </span>
             </div>
 
             {conversations.length === 0 ? (
-              <div className="text-sm text-sidebar-foreground italic">
+              <div className="text-xs sm:text-sm text-sidebar-foreground italic">
                 No chats yet
               </div>
             ) : (
@@ -1392,7 +1635,7 @@ export default function ChatbotUI() {
                   className={`flex items-center justify-between p-2 rounded transition-colors
                     ${
                       idx === currentIndex
-                        ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                        ? "bg-gray-700 text-white"
                         : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
                     }
                     cursor-pointer
@@ -1416,7 +1659,7 @@ export default function ChatbotUI() {
                     />
                   ) : (
                     <span
-                      className="text-sm text-sidebar-foreground cursor-pointer"
+                      className="text-xs sm:text-sm text-sidebar-foreground cursor-pointer truncate"
                       onClick={() => handleConversationClick(idx, conv.id)}
                     >
                       {conv.title}
@@ -1436,7 +1679,7 @@ export default function ChatbotUI() {
                     </button>
 
                     {openMenuId === conv.id && (
-                      <div className="absolute right-0 mt-1 w-32 bg-sidebar-accent border border-sidebar-border rounded shadow-lg z-20">
+                      <div className="absolute right-0 mt-1 w-32 bg-gray-900 border border-sidebar-border rounded shadow-lg z-20">
                         <button
                           className="w-full text-left px-4 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-primary flex items-center gap-2 cursor-pointer"
                           onClick={() => startInlineRename(conv.id, conv.title)}
@@ -1461,17 +1704,17 @@ export default function ChatbotUI() {
             )}
           </div>
 
-          <div className="p-4 border-t border-sidebar-border relative">
+          <div className="p-3 sm:p-4 border-t border-sidebar-border relative">
             {user ? (
               <div>
                 <button
                   onClick={handleUserMenuToggle}
                   className="flex items-center justify-between gap-2 w-full focus:outline-none"
                 >
-                  <div className="w-12 h-8 bg-sidebar-accent rounded-full flex items-center justify-center">
+                  <div className="w-12 h-8 bg-black rounded-full flex items-center justify-center">
                     <UserIcon className="w-4 h-4 text-sidebar-foreground" />
                   </div>
-                  <span className="block w-full text-left text-sm text-sidebar-foreground justify-left">
+                  <span className="block w-full text-left text-xs sm:text-sm text-sidebar-foreground justify-left truncate">
                     {user.user_metadata.full_name}
                   </span>
                   <ChevronDown
@@ -1482,7 +1725,7 @@ export default function ChatbotUI() {
                 </button>
 
                 {showUserMenu && (
-                  <div className="absolute bottom-full inset-x-0 ml-2 mb-2 w-9/10 bg-sidebar-accent border border-sidebar-border rounded shadow-lg z-50">
+                  <div className="absolute bottom-full inset-x-0 ml-2 mb-2 w-9/10 bg-black border border-sidebar-border rounded shadow-lg z-50">
                     <button
                       onClick={openProfileModal}
                       className="w-full text-left px-4 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-primary cursor-pointer"
@@ -1510,8 +1753,7 @@ export default function ChatbotUI() {
                   <Button
                     variant="secondary"
                     size="lg"
-                    color-text="black"
-                    className="cursor-pointer"
+                    className="cursor-pointer text-blue-400 hover:text-blue-300 border-blue-400 hover:border-blue-300"
                   >
                     Log in
                   </Button>
@@ -1520,7 +1762,7 @@ export default function ChatbotUI() {
                   <Button
                     size="lg"
                     variant="default"
-                    className="cursor-pointer"
+                    className="cursor-pointer bg-blue-600 hover:bg-blue-700 text-white"
                   >
                     Sign up
                   </Button>
@@ -1532,10 +1774,10 @@ export default function ChatbotUI() {
       )}
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col min-h-0">
+      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
         {/* Header */}
-        <div className="h-16 border-b border-border flex items-center justify-between px-6 flex-shrink-0">
-          <div className="flex items-center gap-4">
+        <div className="h-16 border-b border-border flex items-center justify-between px-4 sm:px-6 flex-shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
             {!showLeftSidebar && (
               <button
                 onClick={() => setShowLeftSidebar(true)}
@@ -1544,29 +1786,91 @@ export default function ChatbotUI() {
                 <Menu className="w-4 h-4" />
               </button>
             )}
-            <Select value={selectedModel} onValueChange={setSelectedModel}>
-              <SelectTrigger className="w-48 bg-input border-border">
+
+            {/* Product Name and Model Selection */}
+            <div className="flex items-center gap-2">
+              <h1 className="text-base sm:text-lg font-semibold text-foreground">
+                Comfit Copilot
+              </h1>
+
+              {/* Model Selection*/}
+              <Select
+                value={selectedModel}
+                onValueChange={(value) => {
+                  console.log("DEBUG: Model selection changed to:", value);
+                  setSelectedModel(value);
+                }}
+              >
+                <SelectTrigger className="w-32 sm:w-40 bg-transparent border-none shadow-none focus:ring-0 focus:ring-offset-0">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-black">
+                  {models.length === 0 ? (
+                    <SelectItem value="none" disabled>
+                      (no models available)
+                    </SelectItem>
+                  ) : (
+                    models.map((m) => (
+                      <SelectItem key={m} value={m}>
+                        {m}
+                      </SelectItem>
+                    ))
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* RAG Method Selection */}
+            <Select
+              value={selectedRagMethod}
+              onValueChange={setSelectedRagMethod}
+            >
+              <SelectTrigger className="w-36 sm:w-44 bg-input border-border">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent>
-                {models.length === 0 ? (
-                  <SelectItem value="none" disabled>
-                    (no models available)
-                  </SelectItem>
-                ) : (
-                  models.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))
-                )}
+              <SelectContent className="bg-black">
+                <SelectItem value="RAC Enhanced Hybrid RAG">
+                  RAC Enhanced Hybrid RAG
+                </SelectItem>
+                <SelectItem value="Planning Workflow">
+                  Planning Workflow
+                </SelectItem>
+                <SelectItem value="Multi-Step Query Engine">
+                  Multi-Step Query Engine
+                </SelectItem>
+                <SelectItem value="Multi-Strategy Workflow">
+                  Multi-Strategy Workflow
+                </SelectItem>
+                <SelectItem value="No Specific RAG Method">
+                  No Specific RAG Method
+                </SelectItem>
+              </SelectContent>
+            </Select>
+
+            {/* Retrieval Method Selection */}
+            <Select
+              value={selectedRetrievalMethod}
+              onValueChange={setSelectedRetrievalMethod}
+            >
+              <SelectTrigger className="w-32 sm:w-40 bg-input border-border">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="bg-black">
+                <SelectItem value="local context only">
+                  Local Context Only
+                </SelectItem>
+                <SelectItem value="Web searched context only">
+                  Web Searched Context Only
+                </SelectItem>
+                <SelectItem value="Hybrid context">Hybrid Context</SelectItem>
+                <SelectItem value="Smart retrieval">Smart Retrieval</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           {!showRightSidebar && (
             <button
-              onClick={() => setShowRightSidebar(!showRightSidebar)}
+              onClick={() => setShowRightSidebar(true)}
               className="text-muted-foreground hover:text-foreground hover:bg-accent p-2 rounded flex items-center gap-2"
             >
               <Settings className="w-4 h-4" />
@@ -1577,14 +1881,14 @@ export default function ChatbotUI() {
         {/* Chat Area */}
         <div className="flex-1 flex flex-col min-h-0">
           {isWelcomeState ? (
-            <div className="flex-1 flex flex-col items-center justify-center p-8">
-              <h1 className="text-3xl font-light mb-12 text-center">
+            <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8">
+              <h1 className="text-xl sm:text-2xl lg:text-3xl font-light mb-6 sm:mb-8 lg:mb-12 text-center px-4">
                 What would you like to know?
               </h1>
 
-              <div className="flex gap-4 mb-8">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 mb-6 sm:mb-8 max-w-6xl mx-auto px-4 w-full">
                 <button
-                  className="border border-border text-muted-foreground hover:bg-accent px-4 py-2 rounded cursor-pointer"
+                  className="border border-border text-muted-foreground hover:bg-accent px-3 sm:px-4 py-2 rounded cursor-pointer text-left text-sm sm:text-base"
                   onClick={() =>
                     handleExampleClick(
                       "What is your name and who developed you?"
@@ -1594,7 +1898,7 @@ export default function ChatbotUI() {
                   What is your name and who developed you?
                 </button>
                 <button
-                  className="border border-border text-muted-foreground hover:bg-accent px-4 py-2 rounded cursor-pointer"
+                  className="border border-border text-muted-foreground hover:bg-accent px-3 sm:px-4 py-2 rounded cursor-pointer text-left text-sm sm:text-base"
                   onClick={() =>
                     handleExampleClick(
                       "Why is bending your knees before lifting safer than keeping your legs straight?"
@@ -1605,7 +1909,7 @@ export default function ChatbotUI() {
                   your legs straight?
                 </button>
                 <button
-                  className="border border-border text-muted-foreground hover:bg-accent px-4 py-2 rounded cursor-pointer"
+                  className="border border-border text-muted-foreground hover:bg-accent px-3 sm:px-4 py-2 rounded cursor-pointer text-left text-sm sm:text-base"
                   onClick={() =>
                     handleExampleClick(
                       "Explain why slipping on a wet surface leads to a fall—what forces and frictional changes are at play?"
@@ -1618,15 +1922,25 @@ export default function ChatbotUI() {
               </div>
             </div>
           ) : (
-            <div className="flex-1 overflow-y-auto p-6 chat-scrollbar">
-              <div className="max-w-3xl mx-auto space-y-6">
+            <div className="flex-1 overflow-y-auto p-4 sm:p-6 chat-scrollbar">
+              <div className="max-w-4xl mx-auto space-y-4 sm:space-y-6">
                 {currentMessages.map((message, idx) => {
+                  // Debug: Log message details for AI messages
+                  if (message.sender === "ai") {
+                    console.log("DEBUG: Rendering AI message:", {
+                      id: message.id,
+                      content: message.content.substring(0, 50) + "...",
+                      thinkingTime: message.thinkingTime,
+                      hasThinkingTime: message.thinkingTime != null,
+                    });
+                  }
+
                   return (
-                    <div key={message.id} className="flex gap-4">
+                    <div key={message.id} className="flex gap-3 sm:gap-4">
                       {message.sender === "user" ? (
-                        <div className="ml-auto max-w-xs lg:max-w-md flex flex-col items-end">
+                        <div className="ml-auto max-w-[280px] sm:max-w-xs lg:max-w-md flex flex-col items-end">
                           {/* User bubble */}
-                          <div className="bg-secondary text-secondary-foreground p-2.5 rounded-lg whitespace-pre-wrap break-words max-w-full">
+                          <div className="bg-gray-600 text-white p-3 rounded-2xl rounded-br-md whitespace-pre-wrap break-words max-w-full shadow-sm">
                             {editingId === message.id ? (
                               <div className="space-y-2">
                                 <textarea
@@ -1737,21 +2051,21 @@ export default function ChatbotUI() {
                       ) : (
                         // AI bubble
                         message.sender === "ai" && (
-                          <div className="max-w-xs lg:max-w-md">
+                          <div className="max-w-[280px] sm:max-w-xs lg:max-w-md">
                             {message.isThinking ? (
                               // Show only thinking indicator during regeneration
-                              <div className="bg-card text-card-foreground p-3 rounded-lg w-full">
+                              <div className="bg-gray-100 text-gray-800 p-3 rounded-2xl rounded-bl-md w-full shadow-sm">
                                 <div className="flex items-center gap-2">
-                                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"></div>
+                                  <div className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"></div>
                                   <div
-                                    className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"
+                                    className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"
                                     style={{ animationDelay: "0.2s" }}
                                   ></div>
                                   <div
-                                    className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"
+                                    className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"
                                     style={{ animationDelay: "0.4s" }}
                                   ></div>
-                                  <span className="text-muted-foreground text-sm ml-2">
+                                  <span className="text-gray-600 text-sm ml-2">
                                     Thinking...
                                   </span>
                                 </div>
@@ -1780,7 +2094,7 @@ export default function ChatbotUI() {
                                           onClick={() =>
                                             toggleThoughts(message.id)
                                           }
-                                          className="mt-2 mr-1 mb-2 text-xs text-primary hover:underline cursor-pointer"
+                                          className="text-white mt-2 mr-1 mb-2 text-xs hover:underline cursor-pointer"
                                         >
                                           {showThoughts[message.id]
                                             ? "Hide reasoning"
@@ -1790,7 +2104,7 @@ export default function ChatbotUI() {
                                       {/* collapsible reasoning box */}
                                       {thoughtHtml &&
                                         showThoughts[message.id] && (
-                                          <div className="bg-card text-card-foreground p-3 rounded-lg mt-1 mb-2 whitespace-pre-wrap">
+                                          <div className="bg-blue-50/80 text-gray-800 p-3 rounded-lg mt-1 mb-2 whitespace-pre-wrap border border-blue-200/50">
                                             <div
                                               dangerouslySetInnerHTML={{
                                                 __html: thoughtHtml,
@@ -1801,7 +2115,7 @@ export default function ChatbotUI() {
                                       {/* final answer */}
                                       <FormattedContent
                                         html={mainHtml}
-                                        className="bg-card text-card-foreground p-3 rounded-lg w-full custom-list max-w-full leading-relaxed"
+                                        className="bg-gray-100 text-gray-800 p-3 rounded-2xl rounded-bl-md w-full custom-list max-w-full leading-relaxed shadow-sm"
                                       />
                                     </div>
                                   );
@@ -1846,8 +2160,19 @@ export default function ChatbotUI() {
                                   </button>
                                   <button
                                     onClick={() => handleRegenerate(message.id)}
-                                    className="hover:text-foreground cursor-pointer"
-                                    disabled={isRegenerating}
+                                    title={
+                                      message.isThinking
+                                        ? "Regenerating..."
+                                        : "Regenerate response"
+                                    }
+                                    className={`hover:text-foreground cursor-pointer transition-colors ${
+                                      message.isThinking
+                                        ? "animate-spin text-blue-500"
+                                        : ""
+                                    }`}
+                                    disabled={
+                                      isRegenerating || message.isThinking
+                                    }
                                   >
                                     <RefreshCw className="w-4 h-4" />
                                   </button>
@@ -1874,20 +2199,20 @@ export default function ChatbotUI() {
                 })}
 
                 {isAwaitingResponse && (
-                  <div className="flex gap-4">
-                    <div className="max-w-xs lg:max-w-md">
-                      <div className="bg-card text-card-foreground p-3 rounded-lg w-full">
+                  <div className="flex gap-3 sm:gap-4">
+                    <div className="max-w-[280px] sm:max-w-xs lg:max-w-md">
+                      <div className="bg-gray-100 text-gray-800 p-3 rounded-2xl rounded-bl-md w-full shadow-sm">
                         <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"></div>
+                          <div className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"></div>
                           <div
-                            className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"
+                            className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"
                             style={{ animationDelay: "0.2s" }}
                           ></div>
                           <div
-                            className="w-2 h-2 bg-muted-foreground rounded-full animate-pulse"
+                            className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"
                             style={{ animationDelay: "0.4s" }}
                           ></div>
-                          <span className="text-muted-foreground text-sm ml-2">
+                          <span className="text-gray-600 text-sm ml-2">
                             Thinking...
                           </span>
                         </div>
@@ -1901,33 +2226,51 @@ export default function ChatbotUI() {
           )}
 
           {/* Input Area*/}
-          <div className="p-6 border-t border-border flex-shrink-0">
-            <div className="max-w-3xl mx-auto">
+          <div className="p-4 sm:p-6 border-t border-border flex-shrink-0">
+            <div className="max-w-4xl mx-auto">
               {/* Active Features Display */}
-              {activeFeatures.length > 0 && (
-                <div className="mb-3 flex flex-wrap gap-2">
-                  {activeFeatures.map((feature) => (
-                    <div
-                      key={feature}
-                      className="flex items-center gap-2 bg-primary text-primary-foreground px-3 py-1 rounded-full text-sm"
-                    >
-                      <span>{feature}</span>
-                      <button
-                        onClick={() => clearFeature(feature)}
-                        className="hover:bg-primary/80 rounded-full p-0.5 transition-colors"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
-                    </div>
-                  ))}
-                  <button
-                    onClick={clearAllFeatures}
-                    className="text-muted-foreground hover:text-foreground text-sm underline transition-colors"
-                  >
-                    Clear all
-                  </button>
+              <div className="mb-3 flex flex-wrap gap-2">
+                {/* Engine Type Indicator */}
+                <div className="flex items-center gap-2 bg-blue-600 text-white px-3 py-1 rounded-full text-sm">
+                  {engineType === "chat" ? (
+                    <>
+                      <MessageSquare className="w-3 h-3" />
+                      <span>Chat Engine</span>
+                    </>
+                  ) : (
+                    <>
+                      <Database className="w-3 h-3" />
+                      <span>Query Engine</span>
+                    </>
+                  )}
                 </div>
-              )}
+
+                {/* Other Active Features */}
+                {activeFeatures.length > 0 && (
+                  <>
+                    {activeFeatures.map((feature) => (
+                      <div
+                        key={feature}
+                        className="flex items-center gap-2 bg-primary text-primary-foreground px-3 py-1 rounded-full text-sm"
+                      >
+                        <span>{feature}</span>
+                        <button
+                          onClick={() => clearFeature(feature)}
+                          className="hover:bg-primary/80 rounded-full p-0.5 transition-colors"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      onClick={clearAllFeatures}
+                      className="text-muted-foreground hover:text-foreground text-sm underline transition-colors"
+                    >
+                      Clear all
+                    </button>
+                  </>
+                )}
+              </div>
 
               <div className="relative">
                 <textarea
@@ -1969,49 +2312,83 @@ export default function ChatbotUI() {
                           onClick={(e) => e.stopPropagation()}
                         >
                           <div className="p-2">
+                            {/* Engine Type Toggle */}
+                            <div className="mb-2 p-2 bg-gray-900 rounded">
+                              <div className="text-xs text-gray-400 mb-1">
+                                Engine Type
+                              </div>
+                              <div className="flex gap-1">
+                                <button
+                                  onClick={() => setEngineType("chat")}
+                                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
+                                    engineType === "chat"
+                                      ? "bg-blue-600 text-white"
+                                      : "text-gray-300 hover:text-white hover:bg-gray-700"
+                                  }`}
+                                >
+                                  <MessageSquare className="w-3 h-3" />
+                                  Chat
+                                </button>
+                                <button
+                                  onClick={() => setEngineType("query")}
+                                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
+                                    engineType === "query"
+                                      ? "bg-blue-600 text-white"
+                                      : "text-gray-300 hover:text-white hover:bg-gray-700"
+                                  }`}
+                                >
+                                  <Database className="w-3 h-3" />
+                                  Query
+                                </button>
+                              </div>
+                              <div className="text-xs text-gray-500 mt-1">
+                                {engineType === "chat"
+                                  ? "Maintains conversation context"
+                                  : "More accurate but no chat context"}
+                              </div>
+                            </div>
+
                             {/* Vector Store */}
                             <div className="relative">
                               <button
                                 onClick={() => toggleSubmenu("vector-store")}
-                                className="w-full flex items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors"
+                                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
                               >
+                                <VectorSquare className="w-4 h-4" />
                                 <span>Vector Store</span>
-                                <ChevronRight
-                                  className={`w-4 h-4 transition-transform ${
-                                    openSubmenu === "vector-store"
-                                      ? "rotate-90"
-                                      : ""
-                                  }`}
-                                />
+                                <ChevronRight className="w-4 h-4 ml-auto" />
                               </button>
                               {openSubmenu === "vector-store" && (
-                                <div className="ml-4 mt-1 space-y-1">
-                                  {[
-                                    "Vector Store - Medical",
-                                    "Vector Store - Research",
-                                    "Vector Store - Clinical",
-                                  ].map((option) => (
-                                    <button
-                                      key={option}
-                                      onClick={() => selectFeature(option)}
-                                      className="w-full flex bg-black items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors"
-                                    >
-                                      <span>{option.split(" - ")[1]}</span>
-                                      {activeFeatures.includes(option) && (
-                                        <Check className="w-4 h-4" />
-                                      )}
-                                    </button>
-                                  ))}
+                                <div className="absolute left-full top-0 ml-2 w-64 bg-black border border-border rounded-lg shadow-lg cursor-pointer">
+                                  <div className="p-2">
+                                    {[
+                                      "Vector Store - CFIR",
+                                      "Vector Store - Injury Typology",
+                                      "Vector Store - Anatomical Regions",
+                                    ].map((option) => (
+                                      <button
+                                        key={option}
+                                        onClick={() => selectFeature(option)}
+                                        className="w-full flex items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
+                                      >
+                                        <span>{option.split(" - ")[1]}</span>
+                                        {activeFeatures.includes(option) && (
+                                          <Check className="w-4 h-4" />
+                                        )}
+                                      </button>
+                                    ))}
+                                  </div>
                                 </div>
                               )}
                             </div>
 
-                            {/* Upload File */}
+                            {/* Add Files */}
                             <label
                               htmlFor="file-upload"
-                              className="w-full flex items-center px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
+                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
                             >
-                              <span>Upload File</span>
+                              <Paperclip className="w-4 h-4" />
+                              <span>Add Files</span>
                               <input
                                 id="file-upload"
                                 type="file"
@@ -2021,82 +2398,48 @@ export default function ChatbotUI() {
                                 className="sr-only"
                               />
                             </label>
-
-                            {/* Web Search */}
-                            <button
-                              onClick={() => selectFeature("Web Search")}
-                              className="w-full flex items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors"
-                            >
-                              <span>Web Search</span>
-                              {activeFeatures.includes("Web Search") && (
-                                <Check className="w-4 h-4" />
-                              )}
-                            </button>
-
-                            {/* Strategies */}
-                            <div className="relative">
-                              <button
-                                onClick={() => toggleSubmenu("strategies")}
-                                className="w-full flex items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors"
-                              >
-                                <span>Strategies</span>
-                                <ChevronRight
-                                  className={`w-4 h-4 transition-transform ${
-                                    openSubmenu === "strategies"
-                                      ? "rotate-90"
-                                      : ""
-                                  }`}
-                                />
-                              </button>
-                              {openSubmenu === "strategies" && (
-                                <div className="ml-4 mt-1 space-y-1">
-                                  {[
-                                    "Strategies - Reasoning",
-                                    "Strategies - Analysis",
-                                    "Strategies - Synthesis",
-                                  ].map((option) => (
-                                    <button
-                                      key={option}
-                                      onClick={() => selectFeature(option)}
-                                      className="w-full flex items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors"
-                                    >
-                                      <span>{option.split(" - ")[1]}</span>
-                                      {activeFeatures.includes(option) && (
-                                        <Check className="w-4 h-4" />
-                                      )}
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
                           </div>
                         </div>
                       )}
                     </div>
+                  </div>
 
-                    {/* Voice Mode Icon - needs implementation*/}
+                  {/* Voice Mode Icon and send/cancel button */}
+                  <div className="flex items-center gap-2">
                     <button className="flex items-center justify-center w-8 h-8 cursor-pointer hover:bg-accent rounded transition-colors duration-150">
                       <Mic className="w-5 h-5 text-muted-foreground" />
                     </button>
-                  </div>
 
-                  {/* send/cancel button */}
-                  <button
-                    onClick={
-                      isAwaitingResponse ? handleCancel : handleSendMessage
-                    }
-                    disabled={
-                      limitReached ||
-                      (!isAwaitingResponse && !inputValue.trim())
-                    }
-                    className="w-8 h-8 rounded-lg bg-primary hover:bg-primary/80 flex items-center justify-center transition-colors duration-150 disabled:bg-primary/60 disabled:cursor-not-allowed"
-                  >
-                    {isAwaitingResponse ? (
-                      <X size={20} />
-                    ) : (
-                      <ArrowUp size={20} />
-                    )}
-                  </button>
+                    <button
+                      onClick={
+                        isAwaitingResponse ? handleCancel : handleSendMessage
+                      }
+                      disabled={
+                        limitReached ||
+                        (!isAwaitingResponse && !inputValue.trim())
+                      }
+                      title={
+                        isAwaitingResponse
+                          ? "Cancel AI response"
+                          : inputValue.trim()
+                          ? "Send message"
+                          : "Type a message to send"
+                      }
+                      className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all duration-150 ${
+                        isAwaitingResponse
+                          ? "bg-red-500 hover:bg-red-600 text-white shadow-lg"
+                          : inputValue.trim()
+                          ? "bg-blue-600 hover:bg-blue-700 text-white shadow-md hover:shadow-lg"
+                          : "bg-gray-400 text-gray-600 cursor-not-allowed"
+                      }`}
+                    >
+                      {isAwaitingResponse ? (
+                        <X size={20} className="animate-pulse" />
+                      ) : (
+                        <ArrowUp size={20} />
+                      )}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2106,10 +2449,10 @@ export default function ChatbotUI() {
 
       {/* Right Sidebar*/}
       {showRightSidebar && (
-        <div className="w-80 bg-sidebar border-l border-sidebar-border flex flex-col max-h-screen overflow-y-auto sidebar-scrollbar">
-          <div className="p-4">
-            <div className="flex items-center justify-between mb-4">
-              <span className="text-lg font-medium text-sidebar-primary-foreground">
+        <div className="w-64 sm:w-80 bg-sidebar border-l border-sidebar-border flex flex-col max-h-screen overflow-y-auto sidebar-scrollbar">
+          <div className="p-3 sm:p-4">
+            <div className="flex items-center justify-between mb-3 sm:mb-4">
+              <span className="text-base sm:text-lg font-medium text-sidebar-primary-foreground">
                 Advanced Settings
               </span>
               <button
@@ -2273,6 +2616,83 @@ export default function ChatbotUI() {
                   </div>
                 )}
               </div>
+
+              {/* Mechanistic Interpretability */}
+              <div className="border-b border-sidebar-border">
+                <button
+                  onClick={() => toggleAccordion("interpretability")}
+                  className="w-full text-left text-sm font-medium text-sidebar-primary-foreground hover:text-sidebar-accent-foreground py-3 flex items-center justify-between cursor-pointer transition-colors"
+                >
+                  <div className="flex items-center gap-2">
+                    Mechanistic Interpretability
+                  </div>
+                  <ChevronDown
+                    className={`w-4 h-4 transition-transform text-sidebar-primary-foreground ${
+                      openAccordions.includes("interpretability")
+                        ? "rotate-180"
+                        : ""
+                    }`}
+                  />
+                </button>
+                {openAccordions.includes("interpretability") && (
+                  <div className="pb-4">
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm text-sidebar-primary-foreground">
+                          Enable Interpretability
+                        </label>
+                        <button
+                          onClick={() =>
+                            setMechanisticInterpretability(
+                              !mechanisticInterpretability
+                            )
+                          }
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                            mechanisticInterpretability
+                              ? "bg-primary"
+                              : "bg-sidebar-border"
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              mechanisticInterpretability
+                                ? "translate-x-6"
+                                : "translate-x-1"
+                            }`}
+                          />
+                        </button>
+                      </div>
+                      {mechanisticInterpretability && (
+                        <div className="space-y-3">
+                          <div>
+                            <label className="text-sm text-sidebar-primary-foreground block mb-2">
+                              Interpretability Level
+                            </label>
+                            <Select defaultValue="basic">
+                              <SelectTrigger className="bg-black-700 border-black text-sidebar-primary-foreground">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent className="bg-black border border-gray-700">
+                                <SelectItem value="basic">Basic</SelectItem>
+                                <SelectItem value="intermediate">
+                                  Intermediate
+                                </SelectItem>
+                                <SelectItem value="advanced">
+                                  Advanced
+                                </SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="text-xs text-sidebar-primary-foreground/70">
+                            This feature will provide insights into how the AI
+                            model processes and generates responses.
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -2307,29 +2727,29 @@ export default function ChatbotUI() {
 
       {/* Delete confirmation modal */}
       {deletingId && (
-        <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/70">
-          <div className="bg-card rounded-lg shadow-lg max-w-sm w-full mx-4">
-            <div className="px-6 py-4 border-b border-border">
-              <h3 className="text-lg font-semibold text-foreground">
+        <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/50">
+          <div className="bg-gray-800 rounded-lg shadow-lg max-w-sm w-full mx-4">
+            <div className="px-6 py-4 border-b border-gray-700">
+              <h3 className="text-lg font-semibold text-white">
                 Delete Conversation
               </h3>
             </div>
             <div className="px-6 py-4">
-              <p className="text-sm text-muted-foreground">
+              <p className="text-sm text-gray-300">
                 Are you sure you want to delete this conversation? This action
                 cannot be undone.
               </p>
             </div>
-            <div className="px-6 py-4 flex justify-end gap-2 border-t border-border">
+            <div className="px-6 py-4 flex justify-end gap-2 border-t border-gray-700">
               <button
                 onClick={() => setDeletingId(null)}
-                className="px-4 py-1 text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent rounded cursor-pointer"
+                className="px-4 py-1 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 rounded cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 onClick={() => deleteChat(deletingId)}
-                className="px-4 py-1 text-sm font-medium text-white bg-destructive hover:bg-destructive/90 rounded cursor-pointer"
+                className="px-4 py-1 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
               >
                 Delete
               </button>
@@ -2341,7 +2761,7 @@ export default function ChatbotUI() {
       {/* search chats modal*/}
       {showSearchModal && (
         <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/50">
-          <div className="bg-card rounded-lg shadow-lg w-full max-w-md mx-4 p-6">
+          <div className="bg-gray-800 rounded-lg shadow-lg w-full max-w-md mx-4 p-6">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold text-foreground">
                 Search Chats

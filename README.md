@@ -37,4 +37,22 @@ pnpm dev
 bun dev
 ```
 
+For the backend, first download the requirements with
+
+```bash
+pip install -r requirements.txt
+```
+
+Then run the server with
+
+```bash
+python main.py
+```
+
+or
+
+```bash
+python start.py
+```
+
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
