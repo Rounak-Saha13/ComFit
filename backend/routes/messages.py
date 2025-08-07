@@ -1,7 +1,7 @@
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 
-from schemas import Message, History, FeedbackRequest
+from schemas import Message, MessageCreate, MessageUpdate, History, FeedbackRequest
 from database import supabase
 from auth import verify_token, optional_verify_token
 from chat_engine import chat_answer
@@ -21,7 +21,7 @@ class RegenerateRequest(BaseModel):
     retrieval_method: Optional[str] = None
 
 @router.post("/", response_model=Message)
-async def create_message(msg: Message, user_id: str = Depends(verify_token)):
+async def create_message(msg: MessageCreate, user_id: str = Depends(verify_token)):
     logger.debug("create_message: inserting message %s for user %s", msg, user_id)
     insert_resp = supabase.table("messages") \
         .insert(msg.model_dump()) \
@@ -61,7 +61,7 @@ async def get_messages(cid: str, user_id: str = Depends(verify_token)):
         raise HTTPException(500, f"Failed to fetch messages: {str(e)}")
 
 @router.patch("/{mid}", response_model=Message)
-async def edit_message(mid: str, body: Message, user_id: str = Depends(verify_token)):
+async def edit_message(mid: str, body: MessageUpdate, user_id: str = Depends(verify_token)):
     try:
         resp = supabase.table("messages") \
             .select("*, conversations!inner(user_id)") \
@@ -72,8 +72,11 @@ async def edit_message(mid: str, body: Message, user_id: str = Depends(verify_to
         if not resp.data:
             raise HTTPException(404, "Message not found or access denied")
 
+        # Only update fields that are not None
+        update_data = {k: v for k, v in body.model_dump().items() if v is not None}
+        
         update_resp = supabase.table("messages") \
-            .update(body.model_dump()) \
+            .update(update_data) \
             .eq("id", mid) \
             .execute()
 
@@ -127,6 +130,8 @@ async def regenerate(
         model = ai_msg["model"]
         preset = ai_msg["preset"]
         temperature = ai_msg["temperature"]
+        rag_method = ai_msg["method"]
+        retrieval_method = ai_msg["retrieval_method"]
 
         history_resp = supabase.table("messages") \
             .select("id, content, sender") \
@@ -194,6 +199,61 @@ async def create_branch(
     if not conv_resp.data:
         raise HTTPException(404, "Branch Error: Conversation not found")
 
+    # Check if this is the first branch for this edit_at_id
+    existing_branches = supabase.table("branches") \
+        .select("id") \
+        .eq("conversation_id", cid) \
+        .eq("edit_at_id", edit_at_id) \
+        .execute()
+    
+    logger.info(f"create_branch: existing branches for edit {edit_at_id}: {existing_branches.data}")
+    
+    # If no branches exist for this edit, we need to create the original branch first
+    if not existing_branches.data:
+        logger.info(f"create_branch: creating original branch for edit {edit_at_id}")
+        
+        # First check if the edit_at_id exists in the messages table
+        edit_message_resp = supabase.table("messages") \
+            .select("id") \
+            .eq("id", edit_at_id) \
+            .execute()
+        
+        if not edit_message_resp.data:
+            logger.warning(f"create_branch: edit_at_id {edit_at_id} not found in messages table, skipping original branch creation")
+            # Don't create original branch if the edit_at_id doesn't exist yet
+            # This can happen when the new AI message hasn't been saved yet
+        else:
+            # Get the original messages up to the edit point
+            all_messages_resp = supabase.table("messages") \
+                .select("id, content, sender, thinking_time, created_at") \
+                .eq("conversation_id", cid) \
+                .order("created_at", desc=False) \
+                .execute()
+            
+            if all_messages_resp.data:
+                # Find the edit point and get messages up to that point
+                original_messages = []
+                for msg in all_messages_resp.data:
+                    if msg["id"] == edit_at_id:
+                        break
+                    original_messages.append(msg)
+                
+                logger.info(f"create_branch: original messages count: {len(original_messages)}")
+                
+                # Create the original branch
+                try:
+                    original_branch_resp = supabase.table("branches").insert({
+                        "conversation_id": cid,
+                        "edit_at_id": edit_at_id,
+                        "messages": original_messages,
+                        "is_original": True,
+                        "is_active": False,
+                    }).execute()
+                    logger.info(f"create_branch: original branch created: {original_branch_resp.data}")
+                except Exception as e:
+                    logger.error(f"create_branch: failed to create original branch: {e}")
+                    raise HTTPException(500, f"Failed to create original branch: {str(e)}")
+
     # deactivate existing active branch for this edit
     supabase.table("branches") \
         .update({"is_active": False}) \
@@ -202,16 +262,45 @@ async def create_branch(
         .execute()
 
     # insert new active branch
-    branch_resp = supabase.table("branches").insert({
-        "conversation_id": cid,
-        "edit_at_id": edit_at_id,
-        "messages": messages,
-        "is_original": False,
-        "is_active": True,
-    }).select("id").execute()
-    if not branch_resp.data:
-        raise HTTPException(500, "Failed to create branch")
-    return {"branch_id": branch_resp.data[0]["id"]}
+    logger.info(f"create_branch: creating new branch for edit {edit_at_id} with {len(messages)} messages")
+    try:
+        # First check if the edit_at_id exists in messages table
+        edit_message_check = supabase.table("messages") \
+            .select("id") \
+            .eq("id", edit_at_id) \
+            .execute()
+        
+        if not edit_message_check.data:
+            logger.warning(f"create_branch: edit_at_id {edit_at_id} not found in messages table, creating branch without edit_at_id")
+            # Create branch without edit_at_id if the message doesn't exist yet
+            branch_resp = supabase.table("branches") \
+                .insert({
+                    "conversation_id": cid,
+                    "edit_at_id": None,  # Set to None temporarily
+                    "messages": messages,
+                    "is_original": False,
+                    "is_active": True,
+                }) \
+                .execute()
+        else:
+            # Create branch with edit_at_id
+            branch_resp = supabase.table("branches") \
+                .insert({
+                    "conversation_id": cid,
+                    "edit_at_id": edit_at_id,
+                    "messages": messages,
+                    "is_original": False,
+                    "is_active": True,
+                }) \
+                .execute()
+        
+        logger.info(f"create_branch: new branch response: {branch_resp.data}")
+        if not branch_resp.data:
+            raise HTTPException(500, "Failed to create branch")
+        return {"branch_id": branch_resp.data[0]["id"]}
+    except Exception as e:
+        logger.error(f"create_branch: failed to create new branch: {e}")
+        raise HTTPException(500, f"Failed to create new branch: {str(e)}")
 
 @router.patch("/branches/{branch_id}", response_model=dict)
 async def update_branch(

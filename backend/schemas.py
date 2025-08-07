@@ -30,12 +30,17 @@ class MessageBase(BaseModel):
     content: str
 
 class MessageCreate(MessageBase):
+    id: str
+    thinking_time: Optional[int] = Field(None, alias="thinkingTime")
+    feedback: Optional[int] = None
     model: Optional[str] = None
     preset: Optional[str] = None # vector store
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     rag_method: Optional[str] = None
     retrieval_method: Optional[str] = None
+
+    model_config = ConfigDict(validate_by_name=True)
 
 class Message(MessageBase):
     id: str
@@ -51,6 +56,19 @@ class Message(MessageBase):
     created_at: datetime
 
     model_config = ConfigDict(validate_by_name=True, from_attributes=True)
+
+class MessageUpdate(BaseModel):
+    content: Optional[str] = None
+    thinking_time: Optional[int] = Field(None, alias="thinkingTime")
+    feedback: Optional[int] = None
+    model: Optional[str] = None
+    preset: Optional[str] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    rag_method: Optional[str] = None
+    retrieval_method: Optional[str] = None
+
+    model_config = ConfigDict(validate_by_name=True)
 
 # ---- chat ----
 class ChatRequest(BaseModel):

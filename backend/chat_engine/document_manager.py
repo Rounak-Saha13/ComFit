@@ -33,6 +33,11 @@ class DocumentManager:
             from llama_index.core import VectorStoreIndex, Settings
             from llama_index.embeddings.ollama import OllamaEmbedding
             from llama_index.llms.ollama import Ollama
+            import os
+            
+            # Set OLLAMA_HOST environment variable if available
+            ollama_base_url = os.getenv("OLLAMA_BASE_URL", "localhost:11434")
+            os.environ['OLLAMA_HOST'] = ollama_base_url
             
             # Setup embedding model
             Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
@@ -180,6 +185,22 @@ class DocumentManager:
             VectorStoreIndex instance or None if loading failed
         """
         try:
+            # First, check if there's a DuckDB file for this index
+            duckdb_file = self.vector_store_dir / f"{index_name}.duckdb"
+            if duckdb_file.exists():
+                try:
+                    from llama_index.vector_stores.duckdb import DuckDBVectorStore
+                    from llama_index.core import VectorStoreIndex
+                    
+                    logger.info(f"Loading DuckDB vector store: {duckdb_file}")
+                    vector_store = DuckDBVectorStore.from_local(str(duckdb_file))
+                    index = VectorStoreIndex.from_vector_store(vector_store)
+                    logger.info(f"DuckDB vector store '{index_name}' loaded successfully")
+                    return index
+                except Exception as e:
+                    logger.error(f"Error loading DuckDB vector store {index_name}: {e}")
+            
+            # Fallback: try to load as regular LlamaIndex storage context
             from llama_index.core import StorageContext, load_index_from_storage
             
             index_path = self.vector_store_dir / f"{index_name}_index"
@@ -279,4 +300,5 @@ class DocumentManager:
             return False
 
 # Global document manager instance
-document_manager = DocumentManager() 
+# Point to the vector_store directory at the project root
+document_manager = DocumentManager(vector_store_dir="../vector_store") 

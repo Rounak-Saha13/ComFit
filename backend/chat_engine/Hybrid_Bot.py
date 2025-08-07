@@ -67,6 +67,12 @@ class MCPResponse(BaseModel):
 
 # --- LLM Setup (My Code) ---
 OPTIMAL_LLM_MODEL_NAME = "llama3:latest"  # Changed from "llama3" to a more common model
+
+# Set OLLAMA_HOST environment variable early for global instances
+import os
+ollama_base_url = os.getenv("OLLAMA_BASE_URL", "localhost:11434")
+os.environ['OLLAMA_HOST'] = ollama_base_url
+
 OPTIMAL_LLM = Ollama(model=OPTIMAL_LLM_MODEL_NAME, request_timeout=600.0)
 Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
 Settings.llm = OPTIMAL_LLM

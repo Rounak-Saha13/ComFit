@@ -319,35 +319,25 @@ export default function ChatbotUI() {
               messages,
               branchesByEditId = {},
               currentBranchIndexByEditId = {},
+              activeBranchId,
             } = await loadHistory(currentConversation.id);
 
-            // Convert backend field names to frontend field names
+            // Backend already returns thinkingTime correctly, no conversion needed
             const convertedMessages = messages.map((msg: any) => {
-              const converted = {
-                ...msg,
-                thinkingTime: msg.thinking_time,
-              };
               if (msg.sender === "ai") {
                 console.log("DEBUG: Loading AI message from backend:", {
                   id: msg.id,
-                  thinking_time: msg.thinking_time,
-                  thinkingTime: converted.thinkingTime,
+                  thinkingTime: msg.thinkingTime,
                 });
               }
-              return converted;
+              return msg;
             });
 
-            // Convert branch messages as well
+            // Branch messages already have correct field names
             const convertedBranchesByEditId: Record<string, BranchItem[]> = {};
             for (const [editId, branches] of Object.entries(branchesByEditId)) {
               convertedBranchesByEditId[editId] = branches.map(
-                (branch: any) => ({
-                  ...branch,
-                  messages: branch.messages.map((msg: any) => ({
-                    ...msg,
-                    thinkingTime: msg.thinking_time,
-                  })),
-                })
+                (branch: any) => branch
               );
             }
 
@@ -361,6 +351,9 @@ export default function ChatbotUI() {
               };
               return newHist;
             });
+
+            // Set the current branch ID to match the active branch from backend
+            setCurrentBranchId(activeBranchId);
           } catch (err) {
             console.error("Error loading current conversation history:", err);
           }
@@ -455,7 +448,12 @@ export default function ChatbotUI() {
               ...convo,
               messages: convo.messages.map((m) =>
                 m.id === aiMessageId
-                  ? { ...m, content: "", isThinking: true }
+                  ? {
+                      ...m,
+                      content: "",
+                      isThinking: true,
+                      thinkingTime: undefined,
+                    }
                   : m
               ),
             }
@@ -531,7 +529,12 @@ export default function ChatbotUI() {
           const copy = [...prev];
           copy[currentIndex].messages = copy[currentIndex].messages.map((m) =>
             m.id === aiMessageId
-              ? { ...m, content: "Regeneration cancelled", isThinking: false }
+              ? {
+                  ...m,
+                  content: "Regeneration cancelled",
+                  isThinking: false,
+                  thinkingTime: undefined,
+                }
               : m
           );
           return copy;
@@ -549,6 +552,7 @@ export default function ChatbotUI() {
                 ...m,
                 content: "Regeneration failed. Please try again.",
                 isThinking: false,
+                thinkingTime: undefined,
               }
             : m
         );
@@ -605,25 +609,12 @@ export default function ChatbotUI() {
       messages,
       branchesByEditId = {},
       currentBranchIndexByEditId = {},
+      activeBranchId,
     } = await loadHistory(convId);
 
-    // Convert backend field names to frontend field names
-    const convertedMessages = messages.map((msg: any) => ({
-      ...msg,
-      thinkingTime: msg.thinking_time,
-    }));
-
-    // Convert branch messages as well
-    const convertedBranchesByEditId: Record<string, BranchItem[]> = {};
-    for (const [editId, branches] of Object.entries(branchesByEditId)) {
-      convertedBranchesByEditId[editId] = branches.map((branch: any) => ({
-        ...branch,
-        messages: branch.messages.map((msg: any) => ({
-          ...msg,
-          thinkingTime: msg.thinking_time,
-        })),
-      }));
-    }
+    // Backend already returns correct field names, no conversion needed
+    const convertedMessages = messages;
+    const convertedBranchesByEditId = branchesByEditId;
 
     setHistory((prev) => {
       const newHist = [...prev];
@@ -637,7 +628,7 @@ export default function ChatbotUI() {
     });
 
     setCurrentIndex(idx);
-    setCurrentBranchId(null);
+    setCurrentBranchId(activeBranchId);
   };
 
   // move conversation history
@@ -764,7 +755,7 @@ export default function ChatbotUI() {
     }
 
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: uuidv4(),
       content: inputValue,
       sender: "user",
     };
@@ -795,7 +786,7 @@ export default function ChatbotUI() {
       );
 
       const newAi: Message = {
-        id: Date.now().toString(),
+        id: uuidv4(),
         content: aiResp,
         sender: "ai",
         thinkingTime: duration,
@@ -1059,10 +1050,9 @@ export default function ChatbotUI() {
 
   function toBackendMessage(msg: Message) {
     return {
-      ...msg,
-      thinking_time: msg.thinkingTime,
+      content: msg.content,
+      thinking_time: msg.thinkingTime ?? null,
       feedback: msg.feedback ?? null,
-      thinkingTime: undefined,
     };
   }
   // branch logic
@@ -1127,7 +1117,7 @@ export default function ChatbotUI() {
         selectedModel
       );
       const newAi: Message = {
-        id: Date.now().toString(),
+        id: uuidv4(),
         content: aiResp,
         sender: "ai",
         thinkingTime: duration,
@@ -1155,7 +1145,7 @@ export default function ChatbotUI() {
       selectedModel
     );
     const newAi: Message = {
-      id: Date.now().toString(),
+      id: uuidv4(),
       content: aiResp,
       sender: "ai",
       thinkingTime: duration,
@@ -1165,7 +1155,8 @@ export default function ChatbotUI() {
     if (session?.access_token) {
       headers.Authorization = `Bearer ${session.access_token}`;
     }
-    await fetch(`${API_URL}/api/messages`, {
+
+    const messageResponse = await fetch(`${API_URL}/api/messages/`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -1174,44 +1165,55 @@ export default function ChatbotUI() {
         sender: "ai",
         content: newAi.content,
         thinking_time: newAi.thinkingTime,
+        model: selectedModel,
+        preset: preset,
+        temperature: temperature,
+        top_p: topP,
+        rag_method: selectedRagMethod,
+        retrieval_method: selectedRetrievalMethod,
       }),
     });
 
-    const branchedMessages = [...messagesUpToEdit, newAi];
-    const convId = conversations[currentIndex].id;
-    const { data: existingAny } = await supabase
-      .from("branches")
-      .select("id")
-      .eq("conversation_id", convId)
-      .eq("edit_at_id", messageId);
-
-    if (!existingAny?.length) {
-      await supabase.from("branches").insert([
-        {
-          conversation_id: convId,
-          edit_at_id: messageId,
-          messages: originalMessages,
-        },
-      ]);
+    if (!messageResponse.ok) {
+      console.error("Failed to save AI message:", await messageResponse.text());
+      throw new Error(`Failed to save AI message: ${messageResponse.status}`);
     }
 
-    const { data: branchData } = await supabase
-      .from("branches")
-      .insert([
-        {
-          conversation_id: convId,
-          edit_at_id: messageId,
-          messages: branchedMessages,
-        },
-      ])
-      .select("id");
+    console.log("AI message saved successfully:", newAi.id);
 
-    const newBranchId = branchData?.[0]?.id ?? null;
+    // Small delay to ensure the message is fully committed to the database
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const branchedMessages = [...messagesUpToEdit, newAi];
+    const convId = conversations[currentIndex].id;
+
+    // Use the backend API to create branches properly instead of direct Supabase insert
+    if (session?.access_token) {
+      headers.Authorization = `Bearer ${session.access_token}`;
+    }
+
+    const branchResponse = await fetch(
+      `${API_URL}/api/messages/conversations/${convId}/branches`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          edit_at_id: newAi.id, // Use the new AI message ID instead of the original message ID
+          messages: branchedMessages.map(toBackendMessage),
+        }),
+      }
+    );
+
+    if (!branchResponse.ok) {
+      throw new Error("Failed to create branch");
+    }
+
+    const { branch_id: newBranchId } = await branchResponse.json();
 
     setHistory((prev) => {
       const newHist = [...prev];
       const conv = newHist[currentIndex];
-      const eid = messageId;
+      const eid = newAi.id; // Use the new AI message ID as the edit ID
 
       // grab existing branches for this edit, default empty
       const existing = conv.branchesByEditId?.[eid] ?? [];
@@ -1493,12 +1495,44 @@ export default function ChatbotUI() {
     });
     if (!res.ok) throw new Error("Failed to delete conversation");
 
+    // Get current conversation ID being deleted
+    const currentConvId = conversations[currentIndex]?.id;
+    const isDeletingCurrentConv = currentConvId === deletingId;
+
     // remove from both lists by ID
-    setConversations((prev) => prev.filter((c) => c.id !== deletingId));
+    const newConversations = conversations.filter((c) => c.id !== deletingId);
+    setConversations(newConversations);
     setHistory((prev) =>
       prev.filter((_, idx) => conversations[idx]?.id !== deletingId)
     );
-    setCurrentIndex(0);
+
+    // If deleting current conversation, create new chat or go to first conversation
+    if (isDeletingCurrentConv) {
+      if (newConversations.length === 0) {
+        // No conversations left, create a new one
+        const newConvo = await handleNewChat();
+        if (newConvo) {
+          setConversations([newConvo]);
+          setHistory([{ messages: [], editAtId: undefined }]);
+          setCurrentIndex(0);
+        }
+      } else {
+        // Go to first conversation and load its history
+        setCurrentIndex(0);
+        try {
+          await handleConversationClick(0, newConversations[0].id);
+        } catch (err) {
+          console.error("Error loading conversation after deletion:", err);
+        }
+      }
+    } else {
+      // Adjust current index if needed
+      const newIndex = newConversations.findIndex(
+        (c) => c.id === currentConvId
+      );
+      setCurrentIndex(Math.max(0, newIndex));
+    }
+
     setDeletingId(null);
   };
 
@@ -1661,6 +1695,7 @@ export default function ChatbotUI() {
                     <span
                       className="text-xs sm:text-sm text-sidebar-foreground cursor-pointer truncate"
                       onClick={() => handleConversationClick(idx, conv.id)}
+                      title={conv.title}
                     >
                       {conv.title}
                     </span>
@@ -1936,7 +1971,12 @@ export default function ChatbotUI() {
                   }
 
                   return (
-                    <div key={message.id} className="flex gap-3 sm:gap-4">
+                    <div
+                      key={message.id}
+                      className={`flex gap-3 sm:gap-4 ${
+                        message.sender === "ai" ? "w-full" : ""
+                      }`}
+                    >
                       {message.sender === "user" ? (
                         <div className="ml-auto max-w-[280px] sm:max-w-xs lg:max-w-md flex flex-col items-end">
                           {/* User bubble */}
@@ -2049,12 +2089,12 @@ export default function ChatbotUI() {
                           )}
                         </div>
                       ) : (
-                        // AI bubble
+                        // AI message - full width like modern chatbots
                         message.sender === "ai" && (
-                          <div className="max-w-[280px] sm:max-w-xs lg:max-w-md">
+                          <div className="w-full max-w-none">
                             {message.isThinking ? (
                               // Show only thinking indicator during regeneration
-                              <div className="bg-gray-100 text-gray-800 p-3 rounded-2xl rounded-bl-md w-full shadow-sm">
+                              <div className="text-white py-3 w-full">
                                 <div className="flex items-center gap-2">
                                   <div className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"></div>
                                   <div
@@ -2094,7 +2134,7 @@ export default function ChatbotUI() {
                                           onClick={() =>
                                             toggleThoughts(message.id)
                                           }
-                                          className="text-white mt-2 mr-1 mb-2 text-xs hover:underline cursor-pointer"
+                                          className="text-gray-600 mt-2 mr-1 mb-2 text-xs hover:underline cursor-pointer"
                                         >
                                           {showThoughts[message.id]
                                             ? "Hide reasoning"
@@ -2115,21 +2155,21 @@ export default function ChatbotUI() {
                                       {/* final answer */}
                                       <FormattedContent
                                         html={mainHtml}
-                                        className="bg-gray-100 text-gray-800 p-3 rounded-2xl rounded-bl-md w-full custom-list max-w-full leading-relaxed shadow-sm"
+                                        className="text-white py-2 p-4 w-full custom-list max-w-full leading-relaxed"
                                       />
                                     </div>
                                   );
                                 })()}
                                 {/* Thinking time */}
                                 {message.thinkingTime != null && (
-                                  <div className="text-muted-foreground text-sm mt-2 pl-1">
+                                  <div className="text-muted-foreground text-sm mt-2 pl-4">
                                     Thought for{" "}
                                     {(message.thinkingTime / 1000).toFixed(2)}s
                                   </div>
                                 )}
 
                                 {/* Buttons */}
-                                <div className="flex gap-2.5 pt-3 pl-1 text-xs text-muted-foreground">
+                                <div className="flex gap-2.5 pt-3 pl-4 text-xs text-muted-foreground">
                                   <button
                                     onClick={() =>
                                       handleFeedback(message.id, 0)
@@ -2272,28 +2312,46 @@ export default function ChatbotUI() {
                 )}
               </div>
 
-              <div className="relative">
-                <textarea
-                  value={inputValue}
-                  onChange={(e) => {
-                    setInputValue(e.target.value);
-                    const ta = e.target;
-                    ta.style.height = "auto";
-                    ta.style.height = ta.scrollHeight + "px";
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSendMessage();
-                    }
-                  }}
-                  placeholder="Ask Comfit Copilot..."
-                  rows={1}
-                  className="w-full bg-input border border-border text-foreground px-4 py-3 pb-12 rounded-lg resize-none overflow-hidden"
-                  style={{ lineHeight: "1.5", minHeight: "48px" }}
-                />
-                <div className="absolute inset-x-0 bottom-4 flex justify-between px-2">
-                  <div className="flex items-center gap-2">
+              <div className="relative min-h-[48px] bg-input border border-border rounded-lg">
+                {/* Text content area - constrained to not overlap with icons */}
+                <div className="relative" style={{ paddingBottom: "40px" }}>
+                  <textarea
+                    value={inputValue}
+                    onChange={(e) => {
+                      setInputValue(e.target.value);
+                      const ta = e.target;
+                      ta.style.height = "auto";
+                      const newHeight = Math.min(ta.scrollHeight, 160);
+                      ta.style.height = newHeight + "px";
+
+                      // Show scrollbar only when content exceeds max height
+                      if (ta.scrollHeight > 160) {
+                        ta.style.overflowY = "scroll";
+                      } else {
+                        ta.style.overflowY = "hidden";
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage();
+                      }
+                    }}
+                    placeholder="Ask Comfit Copilot..."
+                    rows={1}
+                    className="w-full bg-transparent text-foreground px-4 pt-3 pb-2 resize-none border-none outline-none"
+                    style={{
+                      lineHeight: "1.5",
+                      minHeight: "44px",
+                      maxHeight: "160px",
+                      overflowY: "hidden",
+                    }}
+                  />
+                </div>
+
+                {/* Icon area - absolutely positioned at bottom */}
+                <div className="absolute inset-x-0 bottom-2 flex justify-between items-center px-3 pointer-events-none">
+                  <div className="flex items-center gap-2 pointer-events-auto">
                     {/* Plus dropdown */}
                     <div className="relative">
                       <button
@@ -2405,7 +2463,7 @@ export default function ChatbotUI() {
                   </div>
 
                   {/* Voice Mode Icon and send/cancel button */}
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 pointer-events-auto">
                     <button className="flex items-center justify-center w-8 h-8 cursor-pointer hover:bg-accent rounded transition-colors duration-150">
                       <Mic className="w-5 h-5 text-muted-foreground" />
                     </button>
@@ -2796,7 +2854,8 @@ export default function ChatbotUI() {
                     <div
                       key={conv.id}
                       onClick={() => handleSearchResultClick(idx)}
-                      className="cursor-pointer px-3 py-2 rounded hover:bg-accent text-foreground transition-colors"
+                      className="cursor-pointer px-3 py-2 rounded hover:bg-accent text-foreground transition-colors truncate"
+                      title={conv.title}
                     >
                       {conv.title}
                     </div>

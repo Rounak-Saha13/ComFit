@@ -40,7 +40,7 @@ async def chat(
     print(f"DEBUG: Model type: {type(req.model)}")
     
     try:
-        # Temporarily disable rate limiting for testing
+        # TODO (fix later): Temporarily disable rate limiting for testing
         # check_guest_rate_limit(request, user_id)
         print("DEBUG: Rate limit check bypassed for testing")
     except Exception as e:
@@ -149,11 +149,36 @@ async def chat(
 @router.get("/models", tags=["models"])
 async def list_models():
     print("DEBUG: Models endpoint called")
+    
+    # Check if placeholder mode is enabled
+    import os
+    use_placeholder_responses = os.getenv("USE_PLACEHOLDER_RESPONSES", "false").lower() == "true"
+    
+    if use_placeholder_responses:
+        print("DEBUG: Placeholder mode enabled - returning mock models")
+        # Return a list of common model names that would typically be available
+        mock_models = [
+            "llama3:latest",
+            "qwen2.5:latest", 
+            "qwen2.5:7b",
+            "qwen2.5:14b",
+            "qwen2.5:32b",
+            "llama3.1:latest",
+            "llama3.1:8b",
+            "llama3.1:70b",
+            "mistral:latest",
+            "mistral:7b",
+            "codellama:latest",
+            "codellama:7b",
+            "codellama:13b",
+            "codellama:34b"
+        ]
+        return {"models": mock_models}
+    
     try:
         print("DEBUG: Attempting to call ollama.list()")
         
         # Set the OLLAMA_HOST environment variable to use the same remote instance
-        import os
         ollama_host = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         os.environ['OLLAMA_HOST'] = ollama_host
         print(f"DEBUG: Using OLLAMA_HOST: {ollama_host}")

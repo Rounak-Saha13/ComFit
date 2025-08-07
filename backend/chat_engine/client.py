@@ -19,19 +19,55 @@ load_dotenv()
 
 class ChatEngine:
     def __init__(self):
-        self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "192.168.0.240:11434")
+        # TODO: Remove this once we have a proper way to set the ollama base url
+        #self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://192.168.0.240:11434")
+        self.ollama_base_url = "http://192.168.0.240:11434"
         print(f"DEBUG: ChatEngine initialized with ollama_base_url: {self.ollama_base_url}")
         self.default_model = "llama3:latest"
         
         # Initialize document manager
         self.document_manager = document_manager
         
+        # Temporary flag to bypass Ollama calls when network is unavailable
+        self.use_placeholder_responses = os.getenv("USE_PLACEHOLDER_RESPONSES", "false").lower() == "true"
+        if self.use_placeholder_responses:
+            print("DEBUG: Placeholder responses enabled - Ollama calls will be bypassed")
+        
+    def _generate_placeholder_response(self, user_message: str, context_memory: Dict[str, Any]) -> str:
+        """
+        Generate a placeholder response when Ollama is not available
+        """
+        # Extract some context to make the response more relevant
+        rag_method = context_memory.get("model_config", {}).get("rag_method", "No Specific RAG Method")
+        preset = context_memory.get("model_config", {}).get("preset", "CFIR")
+        
+        # Create a contextual placeholder response
+        if "comfort" in user_message.lower() or "fitting" in user_message.lower():
+            return f"[PLACEHOLDER RESPONSE] I understand you're asking about comfort and fitting. Based on the {preset} preset and {rag_method} method, I would typically provide detailed guidance on clothing comfort and fitting techniques. However, I'm currently operating in placeholder mode due to network connectivity issues. Please try again when the network connection is restored."
+        
+        elif "injury" in user_message.lower() or "medical" in user_message.lower():
+            return f"[PLACEHOLDER RESPONSE] I see you're asking about injury-related topics. Using the {preset} preset with {rag_method}, I would normally provide comprehensive information about injury assessment and management. Currently in placeholder mode - please reconnect to the network for full functionality."
+        
+        elif "?" in user_message:
+            return f"[PLACEHOLDER RESPONSE] That's an interesting question! With the {rag_method} approach and {preset} knowledge base, I would typically provide a detailed answer. Currently operating in placeholder mode due to network issues. Please try again when connected."
+        
+        else:
+            return f"[PLACEHOLDER RESPONSE] I received your message: '{user_message[:100]}{'...' if len(user_message) > 100 else ''}'. Using {rag_method} method with {preset} preset, I would normally process this request. Currently in placeholder mode - please restore network connection for full AI functionality."
+        
     def validate_model(self, model_name: str) -> bool:
         """
         Validate if a model name is available in Ollama
         """
+        # If placeholder mode is enabled, always return True to avoid validation errors
+        if self.use_placeholder_responses:
+            print(f"DEBUG: Placeholder mode enabled - skipping model validation for {model_name}")
+            return True
+            
         try:
             import ollama
+            import os
+            # Set OLLAMA_HOST environment variable before validating
+            os.environ['OLLAMA_HOST'] = self.ollama_base_url
             ollama.show(model_name)
             return True
         except Exception:
@@ -47,27 +83,65 @@ class ChatEngine:
         Returns:
             Query engine instance or None if not available
         """
+        # If placeholder mode is enabled, return None to avoid any Ollama calls
+        if self.use_placeholder_responses:
+            print(f"DEBUG: Placeholder mode enabled - skipping query engine creation for preset: {preset}")
+            return None
+            
         try:
             # First try to load from document manager (new structure)
             index = self.document_manager.load_index(preset)
             if index:
                 from llama_index.llms.ollama import Ollama
-                llm = Ollama(model=self.default_model, request_timeout=600.0)
+                import os
+                # Set OLLAMA_HOST environment variable to use the configured base URL
+                os.environ['OLLAMA_HOST'] = self.ollama_base_url
+                print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for document manager query engine")
+                llm=Ollama(model=self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
                 return index.as_query_engine(llm=llm)
             
             # If not found in document manager, try to load from root vector_store directory
-            from llama_index.core import StorageContext, load_index_from_storage
             from pathlib import Path
             
-            # vector store directory, change based on where the vector store is stored
+            # Check for DuckDB files first (preset-specific files)
+            # The vector_store directory is at the project root, but we're running from backend/
             root_vector_store = Path("../vector_store")  
             if root_vector_store.exists():
+                # Try to load DuckDB file for the specific preset
+                duckdb_file = root_vector_store / f"{preset}.duckdb"
+                if duckdb_file.exists():
+                    try:
+                        from llama_index.vector_stores.duckdb import DuckDBVectorStore
+                        from llama_index.core import VectorStoreIndex
+                        from llama_index.llms.ollama import Ollama
+                        import os
+                        
+                        # Set OLLAMA_HOST environment variable to use the configured base URL
+                        os.environ['OLLAMA_HOST'] = self.ollama_base_url
+                        print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for DuckDB vector store")
+                        
+                        # Load DuckDB vector store
+                        vector_store = DuckDBVectorStore.from_local(str(duckdb_file))
+                        index = VectorStoreIndex.from_vector_store(vector_store)
+                        
+                        llm = Ollama(model=self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
+                        print(f"DEBUG: Loaded DuckDB vector store for preset: {preset}")
+                        return index.as_query_engine(llm=llm)
+                    except Exception as e:
+                        print(f"DEBUG: Could not load DuckDB vector store for {preset}: {e}")
+                
+                # Fallback: try to load as regular LlamaIndex storage context
                 try:
+                    from llama_index.core import StorageContext, load_index_from_storage
                     storage_context = StorageContext.from_defaults(persist_dir=str(root_vector_store))
                     index = load_index_from_storage(storage_context)
                     if index:
                         from llama_index.llms.ollama import Ollama
-                        llm = Ollama(model=self.default_model, request_timeout=600.0)
+                        import os
+                        # Set OLLAMA_HOST environment variable to use the configured base URL
+                        os.environ['OLLAMA_HOST'] = self.ollama_base_url
+                        print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for root vector store query engine")
+                        llm = Ollama(model=self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
                         print(f"DEBUG: Loaded existing vector store from root directory")
                         return index.as_query_engine(llm=llm)
                 except Exception as e:
@@ -190,6 +264,11 @@ class ChatEngine:
         """
         print(f"DEBUG: _process_default called with user_message: {user_message}")
         
+        # Check if placeholder mode is enabled
+        if self.use_placeholder_responses:
+            print("DEBUG: Using placeholder response mode")
+            return self._generate_placeholder_response(user_message, context_memory)
+        
         try:
             import ollama
             import os
@@ -265,6 +344,7 @@ class ChatEngine:
                 options={
                     "temperature": temperature,
                     "top_p": 0.9,
+                    "num_ctx": 4096, # context window size
                 }
             )
             
@@ -292,6 +372,11 @@ class ChatEngine:
         """
         Process using Planning Workflow
         """
+        # Check if placeholder mode is enabled
+        if self.use_placeholder_responses:
+            print("DEBUG: Using placeholder response mode for planning workflow")
+            return self._generate_placeholder_response(user_message, context_memory)
+            
         try:
             # Import the RAG methods
             from .RAG_methods import run_planning_workflow
@@ -308,8 +393,14 @@ class ChatEngine:
             from llama_index.core import Settings
             from llama_index.core.agent import ReActAgent
             from llama_index.core.tools import FunctionTool
+            import os
             
-            llm = Ollama(model=model, request_timeout=600.0)
+            # Set OLLAMA_HOST environment variable to use the configured base URL
+            os.environ['OLLAMA_HOST'] = self.ollama_base_url
+            print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for planning workflow")
+            
+            # Create Ollama instance with explicit base_url parameter
+            llm = Ollama(model=model, request_timeout=600.0, base_url=self.ollama_base_url)
             Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
             
             # Get local query engine from document manager or root vector store
@@ -374,8 +465,8 @@ class ChatEngine:
             agent = ReActAgent.from_tools(
                 tools=tools,
                 llm=llm,
-                verbose=False,
-                max_iterations=10
+                verbose=True,  # Enable verbose mode to see agent reasoning
+                max_iterations=20  # Increase max iterations
             )
             
             # Execute planning workflow
@@ -395,6 +486,11 @@ class ChatEngine:
         """
         Process using Multi-Step Query Engine
         """
+        # Check if placeholder mode is enabled
+        if self.use_placeholder_responses:
+            print("DEBUG: Using placeholder response mode for multi-step query")
+            return self._generate_placeholder_response(user_message, context_memory)
+            
         try:
             # Import the RAG methods
             from .RAG_methods import run_multi_step_query_engine_workflow
@@ -409,8 +505,13 @@ class ChatEngine:
             from llama_index.llms.ollama import Ollama
             from llama_index.embeddings.ollama import OllamaEmbedding
             from llama_index.core import Settings
+            import os
             
-            llm = Ollama(model=model, request_timeout=600.0)
+            # Set OLLAMA_HOST environment variable to use the configured base URL
+            os.environ['OLLAMA_HOST'] = self.ollama_base_url
+            print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for multi-step query")
+            
+            llm = Ollama(model=model, request_timeout=600.0, base_url=self.ollama_base_url)
             Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
             
             # Get local query engine from document manager or root vector store
@@ -457,6 +558,11 @@ class ChatEngine:
         """
         Process using Multi-Strategy Workflow
         """
+        # Check if placeholder mode is enabled
+        if self.use_placeholder_responses:
+            print("DEBUG: Using placeholder response mode for multi-strategy workflow")
+            return self._generate_placeholder_response(user_message, context_memory)
+            
         try:
             # Import the RAG methods
             from .RAG_methods import run_multi_strategy_workflow
@@ -471,8 +577,13 @@ class ChatEngine:
             from llama_index.llms.ollama import Ollama
             from llama_index.embeddings.ollama import OllamaEmbedding
             from llama_index.core import Settings
+            import os
             
-            llm = Ollama(model=model, request_timeout=600.0)
+            # Set OLLAMA_HOST environment variable to use the configured base URL
+            os.environ['OLLAMA_HOST'] = self.ollama_base_url
+            print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for multi-strategy workflow")
+            
+            llm = Ollama(model=model, request_timeout=600.0, base_url=self.ollama_base_url)
             Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
             
             # Get local query engine from document manager or root vector store
@@ -519,6 +630,11 @@ class ChatEngine:
         """
         Process using RAC Enhanced Hybrid RAG
         """
+        # Check if placeholder mode is enabled
+        if self.use_placeholder_responses:
+            print("DEBUG: Using placeholder response mode for RAC enhanced RAG")
+            return self._generate_placeholder_response(user_message, context_memory)
+            
         try:
             # Import the RAG methods
             from .RAG_methods import process_model_context_query
@@ -535,8 +651,13 @@ class ChatEngine:
             from llama_index.core import Settings
             from llama_index.core.agent import ReActAgent
             from llama_index.core.tools import FunctionTool
+            import os
             
-            llm = Ollama(model=model, request_timeout=600.0)
+            # Set OLLAMA_HOST environment variable to use the configured base URL
+            os.environ['OLLAMA_HOST'] = self.ollama_base_url
+            print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for RAC enhanced RAG")
+            
+            llm = Ollama(model=model, request_timeout=600.0, base_url=self.ollama_base_url)
             Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
             
             # Get local query engine from document manager or root vector store
