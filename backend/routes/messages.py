@@ -1,362 +1,394 @@
-import logging
+from fastapi import APIRouter, HTTPException, Depends, Header, Body
+from typing import Optional, List, Dict, Any
+from datetime import datetime
 import uuid
-from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Body, Request
-
-from schemas import Message, MessageCreate, MessageUpdate, History, FeedbackRequest
-from database import supabase
-from auth import verify_token, optional_verify_token
+import time
+import re
+from fastapi.concurrency import run_in_threadpool
+from schemas import Message, MessageUpdate, FeedbackRequest, TitleRequest, History, BranchItem
 from chat_engine import chat_answer
-from typing import List, Dict, Optional, Any
-from .chat import check_guest_rate_limit
-from pydantic import BaseModel
+from database import supabase, supabase_auth
 
-router = APIRouter(prefix="/messages")
-logger = logging.getLogger(__name__)
+router = APIRouter()
 
-class RegenerateRequest(BaseModel):
-    history: List[Dict[str, Any]]
-    model: str
-    preset: str
-    temperature: float
-    rag_method: Optional[str] = None
-    retrieval_method: Optional[str] = None
-
-@router.post("/", response_model=Message)
-async def create_message(msg: MessageCreate, user_id: str = Depends(verify_token)):
-    logger.debug("create_message: inserting message %s for user %s", msg, user_id)
-    insert_resp = supabase.table("messages") \
-        .insert(msg.model_dump()) \
-        .execute()
-    if not insert_resp.data:
-        logger.error("create_message: failed to insert message, resp=%s", insert_resp)
-        raise HTTPException(500, "Branch Error: Could not insert message")
-    created = insert_resp.data[0]
-    logger.info("create_message: inserted message id=%s", created.get("id"))
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    """Extract user ID from authorization header"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
     
-    # Convert database field names to Pydantic model field names
-    if "thinking_time" in created:
-        created["thinkingTime"] = created.pop("thinking_time")
-    
-    return created
-
-@router.get("/conversation/{cid}", response_model=List[Message])
-async def get_messages(cid: str, user_id: str = Depends(verify_token)):
+    token = authorization.split(" ")[1]
     try:
-        conv_resp = supabase.table("conversations") \
-            .select("id") \
-            .eq("id", cid) \
-            .eq("user_id", user_id) \
-            .execute()
+        # Verify the token and get user info
+        user = supabase_auth.auth.get_user(token)
+        return user.user.id
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-        if not conv_resp.data:
-            raise HTTPException(404, "Conversation not found or access denied")
-
-        resp = supabase.table("messages") \
-            .select("*") \
-            .eq("conversation_id", cid) \
-            .order("created_at", desc=False) \
-            .execute()
-
-        logger.debug("get_messages: fetched %d messages for conversation %s", 
-                     len(resp.data or []), cid)
+@router.get("/messages/conversation/{conversation_id}/history")
+async def get_conversation_history(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user)
+):
+    """Get conversation history with branches"""
+    try:
+        print(f"DEBUG: Loading history for conversation {conversation_id}")
         
-        # Convert database field names to Pydantic model field names
-        messages = resp.data or []
-        for msg in messages:
-            if "thinking_time" in msg:
-                msg["thinkingTime"] = msg.pop("thinking_time")
+        # Verify conversation ownership
+        conv_result = supabase.table("conversations")\
+            .select("id")\
+            .eq("id", conversation_id)\
+            .eq("user_id", user_id)\
+            .execute()
         
-        return messages
+        if not conv_result.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Get all messages for this conversation (main conversation flow)
+        messages_result = supabase.table("messages")\
+            .select("id, conversation_id, sender, content, thinking_time, feedback, model, preset, system_prompt, speculative_decoding, temperature, top_p, strategy, rag_method, retrieval_method, created_at")\
+            .eq("conversation_id", conversation_id)\
+            .order("created_at", desc=False)\
+            .execute()
+        
+        print(f"DEBUG: Found {len(messages_result.data) if messages_result.data else 0} main messages")
+        
+        if not messages_result.data:
+            return History(
+                messages=[],
+                originalMessages=[],
+                branchesByEditId={},
+                currentBranchIndexByEditId={},
+                activeBranchId=None
+            )
+        
+        # Get all branches for this conversation
+        branches_result = supabase.table("branches")\
+            .select("*")\
+            .eq("conversation_id", conversation_id)\
+            .execute()
+        
+        print(f"DEBUG: Found {len(branches_result.data) if branches_result.data else 0} branches")
+        
+        # Organize messages and branches
+        messages = []
+        original_messages = []
+        branches_by_edit_id = {}
+        current_branch_index_by_edit_id = {}
+        active_branch_id = None
+        
+        # Process main conversation messages
+        for msg_data in messages_result.data:
+            # Handle missing thinking_time field gracefully
+            thinking_time = msg_data.get("thinking_time")
+            if thinking_time is None or thinking_time == "":
+                thinking_time = 0
+            else:
+                try:
+                    thinking_time = int(thinking_time)
+                except (ValueError, TypeError):
+                    thinking_time = 0
+            
+            msg = Message(
+                id=msg_data["id"],
+                conversation_id=msg_data["conversation_id"],
+                sender=msg_data["sender"],
+                content=msg_data["content"],
+                thinking_time=thinking_time,
+                feedback=msg_data.get("feedback"),
+                model=msg_data.get("model"),
+                preset=msg_data.get("preset"),
+                system_prompt=msg_data.get("system_prompt"),
+                speculative_decoding=msg_data.get("speculative_decoding", False),
+                temperature=msg_data.get("temperature", 0.7),
+                top_p=msg_data.get("top_p", 1.0),
+                strategy=msg_data.get("strategy"),
+                rag_method=msg_data.get("rag_method"),
+                retrieval_method=msg_data.get("retrieval_method"),
+                created_at=datetime.fromisoformat(msg_data["created_at"])
+            )
+            messages.append(msg)
+        
+        # Process branches - use JSON messages stored in branches table
+        for branch_data in branches_result.data:
+            edit_at_id = branch_data["edit_at_id"]
+            branch_id = branch_data["id"]
+            is_original = branch_data["is_original"]
+            is_active = branch_data["is_active"]
+            
+            print(f"DEBUG: Processing branch {branch_id} (edit_at: {edit_at_id}, is_original: {is_original}, is_active: {is_active})")
+            
+            # Get messages directly from branch JSON (not from messages table)
+            branch_messages_json = branch_data.get("messages", [])
+            branch_messages = []
+            
+            print(f"DEBUG: Branch {branch_id} has {len(branch_messages_json)} JSON messages")
+            
+            # Convert JSON messages to Message objects
+            for msg_json in branch_messages_json:
+                # Handle missing thinking_time field gracefully
+                thinking_time = msg_json.get("thinking_time")
+                if thinking_time is None or thinking_time == "":
+                    thinking_time = 0
+                else:
+                    try:
+                        thinking_time = int(thinking_time)
+                    except (ValueError, TypeError):
+                        thinking_time = 0
+                
+                msg = Message(
+                    id=msg_json["id"],
+                    conversation_id=msg_json["conversation_id"],
+                    sender=msg_json["sender"],
+                    content=msg_json["content"],
+                    thinking_time=thinking_time,
+                    feedback=msg_json.get("feedback"),
+                    model=msg_json.get("model"),
+                    preset=msg_json.get("preset"),
+                    system_prompt=msg_json.get("system_prompt"),
+                    speculative_decoding=msg_json.get("speculative_decoding", False),
+                    temperature=msg_json.get("temperature", 0.7),
+                    top_p=msg_json.get("top_p", 1.0),
+                    strategy=msg_json.get("strategy"),
+                    rag_method=msg_json.get("rag_method"),
+                    retrieval_method=msg_json.get("retrieval_method"),
+                    created_at=datetime.fromisoformat(msg_json["created_at"]) if msg_json.get("created_at") else datetime.utcnow()
+                )
+                branch_messages.append(msg)
+            
+            # Organize by edit point
+            if edit_at_id not in branches_by_edit_id:
+                branches_by_edit_id[edit_at_id] = []
+            
+            branch_item = BranchItem(
+                branch_id=branch_id if not is_original else None,
+                is_original=is_original,
+                messages=branch_messages
+            )
+            
+            branches_by_edit_id[edit_at_id].append(branch_item)
+            
+            # Set current branch index (default to last branch)
+            if edit_at_id not in current_branch_index_by_edit_id:
+                current_branch_index_by_edit_id[edit_at_id] = len(branches_by_edit_id[edit_at_id]) - 1
+            
+            # Set active branch
+            if is_active:
+                active_branch_id = branch_id
+        
+        # Always set original_messages to the main conversation messages
+        # This represents the original conversation flow before any branching
+        original_messages = messages.copy()
+        
+        print(f"DEBUG: Final structure - messages: {len(messages)}, original: {len(original_messages)}, branches: {len(branches_by_edit_id)}")
+        
+        # Create History object with proper field mapping
+        return History(
+            messages=messages,
+            originalMessages=original_messages,
+            branchesByEditId=branches_by_edit_id,
+            currentBranchIndexByEditId=current_branch_index_by_edit_id,
+            activeBranchId=active_branch_id
+        )
+        
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("get_messages: error fetching messages: %s", e)
-        raise HTTPException(500, f"Failed to fetch messages: {str(e)}")
+        print(f"Error getting conversation history: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to get conversation history: {str(e)}")
 
-@router.patch("/{mid}", response_model=Message)
-async def edit_message(mid: str, body: MessageUpdate, user_id: str = Depends(verify_token)):
+@router.post("/messages/{message_id}/feedback")
+async def update_message_feedback(
+    message_id: str,
+    request: FeedbackRequest,
+    user_id: str = Depends(get_current_user)
+):
+    """Update feedback for a message"""
     try:
-        resp = supabase.table("messages") \
-            .select("*, conversations!inner(user_id)") \
-            .eq("id", mid) \
-            .eq("conversations.user_id", user_id) \
+        # Verify message ownership through conversation
+        msg_result = supabase.table("messages")\
+            .select("id, conversation_id")\
+            .eq("id", message_id)\
             .execute()
-
-        if not resp.data:
-            raise HTTPException(404, "Message not found or access denied")
-
-        # Only update fields that are not None
-        update_data = {k: v for k, v in body.model_dump().items() if v is not None}
         
-        update_resp = supabase.table("messages") \
-            .update(update_data) \
-            .eq("id", mid) \
+        if not msg_result.data:
+            raise HTTPException(status_code=404, detail="Message not found")
+        
+        conv_id = msg_result.data[0]["conversation_id"]
+        
+        # Verify conversation ownership
+        conv_result = supabase.table("conversations")\
+            .select("id")\
+            .eq("id", conv_id)\
+            .eq("user_id", user_id)\
             .execute()
-
-        if not update_resp.data:
-            raise HTTPException(500, "Failed to update message")
-
-        # Convert database field names to Pydantic model field names
-        message_data = update_resp.data[0]
-        if "thinking_time" in message_data:
-            message_data["thinkingTime"] = message_data.pop("thinking_time")
         
-        return message_data
+        if not conv_result.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Update feedback
+        result = supabase.table("messages")\
+            .update({"feedback": request.rating})\
+            .eq("id", message_id)\
+            .execute()
+        
+        if result.data:
+            return {"message": "Feedback updated successfully"}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update feedback")
+            
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("edit_message: failed to edit message %s, error=%s", mid, e)
-        raise HTTPException(500, f"Failed to update message: {str(e)}")
+        print(f"Error updating feedback: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update feedback: {str(e)}")
 
-@router.post("/{mid}/feedback", response_model=dict)
-async def feedback(
-    mid: str,
-    request: Request,
-    payload: FeedbackRequest = Body(...),
-    user_id: Optional[str] = Depends(optional_verify_token),
+@router.post("/messages/{message_id}/regenerate")
+async def regenerate_message(
+    message_id: str,
+    request: dict = Body(...),
+    user_id: str = Depends(get_current_user)
 ):
-    check_guest_rate_limit(request, user_id)
-    if user_id:
-        supabase.table("messages") \
-            .update({"feedback": payload.rating}) \
-            .eq("id", mid) \
+    """Regenerate an AI message"""
+    try:
+        # Verify message ownership through conversation
+        msg_result = supabase.table("messages")\
+            .select("id, conversation_id, content")\
+            .eq("id", message_id)\
+            .eq("sender", "ai")\
             .execute()
-    return {"detail": "feedback added"}
-
-@router.post("/{mid}/regenerate", response_model=Message)
-async def regenerate(
-    mid: str,
-    request: Request,
-    payload: Optional[RegenerateRequest] = Body(None),
-    user_id: Optional[str] = Depends(optional_verify_token),
-):
-    # Temporarily disable rate limiting for testing
-    # check_guest_rate_limit(request, user_id)
-
-    if user_id:
-        # logged-in: fetch original, regenerate, update DB
-        resp = supabase.table("messages") \
-            .select("*, conversations!inner(user_id)") \
-            .eq("id", mid) \
-            .eq("conversations.user_id", user_id) \
-            .execute()
-        if not resp.data:
-            raise HTTPException(404, "Message not found or access denied")
-
-        ai_msg = resp.data[0]
-        convo_id = ai_msg["conversation_id"]
-        model = ai_msg["model"]
-        preset = ai_msg["preset"]
-        temperature = ai_msg["temperature"]
-        rag_method = ai_msg["method"]
-        retrieval_method = ai_msg["retrieval_method"]
-
-        history_resp = supabase.table("messages") \
-            .select("id, content, sender") \
-            .eq("conversation_id", convo_id) \
-            .order("created_at", desc=False) \
-            .execute()
-        if not history_resp.data:
-            raise HTTPException(404, "Conversation history not found")
-
-        formatted = [
-            {"role": "user" if m["sender"] == "user" else "assistant",
-             "content": m["content"]}
-            for m in history_resp.data
-        ]
-
-        new_content, duration = await chat_answer(
-            formatted, convo_id, model, preset, temperature, user_id,
-            payload.rag_method or "No Specific RAG Method",
-            payload.retrieval_method or "local context only"
-        )
-
-        update_resp = supabase.table("messages") \
-            .update({"content": new_content, "thinking_time": duration}) \
-            .eq("id", mid) \
-            .execute()
-        if not update_resp.data:
-            raise HTTPException(500, "Failed to update message")
-
-        # Convert database field names to Pydantic model field names
-        message_data = update_resp.data[0]
-        if "thinking_time" in message_data:
-            message_data["thinkingTime"] = message_data.pop("thinking_time")
         
-        return message_data
-
-    else:
-        # guest: require body.history, regenerate in memory
-        if not payload or not payload.history:
-            raise HTTPException(400, "Guests must include `history` in the request body")
-        new_content, duration = await chat_answer(
-            payload.history, mid, payload.model, payload.preset, payload.temperature, user_id,
-            payload.rag_method or "No Specific RAG Method",
-            payload.retrieval_method or "local context only"
-        )
-        return Message(
-            id=mid,
-            content=new_content,
-            thinkingTime=duration,
-            conversation_id=None,
-            sender="assistant",
-        )
-
-@router.post("/conversations/{cid}/branches", response_model=dict)
-async def create_branch(
-    cid: str,
-    request: Request,
-    edit_at_id: str = Body(...),
-    messages: List[Dict[str, Any]] = Body(...),
-    user_id: Optional[str] = Depends(optional_verify_token),
-):
-    check_guest_rate_limit(request, user_id)
-    if not user_id:
-        return {"detail": "Branches only available for logged in users"}
-
-    conv_resp = supabase.table("conversations") \
-        .select("id") \
-        .eq("id", cid) \
-        .eq("user_id", user_id) \
-        .execute()
-    if not conv_resp.data:
-        raise HTTPException(404, "Branch Error: Conversation not found")
-
-    # deactivate existing active branch for this edit
-    supabase.table("branches") \
-        .update({"is_active": False}) \
-        .eq("conversation_id", cid) \
-        .eq("edit_at_id", edit_at_id) \
-        .execute()
-
-    # Format messages to ensure they have all required fields
-    formatted_messages = []
-    for msg in messages:
-        formatted_msg = {
-            "id": msg.get("id"),
-            "conversation_id": cid,
-            "sender": msg.get("sender"),
-            "content": msg.get("content"),
-            "thinking_time": msg.get("thinkingTime", 0),
-            "created_at": msg.get("created_at") or datetime.now(timezone.utc).isoformat(),
-            "feedback": msg.get("feedback"),
-            "model": msg.get("model"),
-            "preset": msg.get("preset"),
-            "temperature": msg.get("temperature"),
-            "top_p": msg.get("top_p"),
-            "rag_method": msg.get("rag_method"),
-            "retrieval_method": msg.get("retrieval_method")
-        }
-        formatted_messages.append(formatted_msg)
-
-    # insert new active branch
-    branch_resp = supabase.table("branches").insert({
-        "conversation_id": cid,
-        "edit_at_id": edit_at_id,
-        "messages": formatted_messages,
-        "is_original": False,
-        "is_active": True,
-    }).execute()
-    if not branch_resp.data:
-        raise HTTPException(500, "Failed to create branch")
-    
-    # Get the ID from the inserted data
-    branch_id = branch_resp.data[0]["id"]
-    return {"branch_id": branch_id}
-
-@router.patch("/branches/{branch_id}", response_model=dict)
-async def update_branch(
-    branch_id: str,
-    messages: List[Dict[str, Any]] = Body(...),
-    user_id: str = Depends(verify_token),
-):
-    branch_resp = supabase.table("branches") \
-        .select("*, conversations!inner(user_id)") \
-        .eq("id", branch_id) \
-        .eq("conversations.user_id", user_id) \
-        .execute()
-    if not branch_resp.data:
-        raise HTTPException(404, "Branch not found")
-
-    update_resp = supabase.table("branches") \
-        .update({"messages": messages}) \
-        .eq("id", branch_id) \
-        .execute()
-    if not update_resp.data:
-        raise HTTPException(500, "Failed to update branch")
-    return {"detail": "Branch updated"}
-
-@router.get("/conversation/{cid}/history", response_model=History)
-async def get_history(cid: str, user_id: Optional[str] = Depends(optional_verify_token)):
-    if not user_id:
-        return {
-            "messages": [],
-            "branchesByEditId": {},
-            "currentBranchIndexByEditId": {},
-        }
-
-    current_branch_resp = supabase.table("branches") \
-        .select("id, messages, edit_at_id") \
-        .eq("conversation_id", cid) \
-        .eq("is_active", True) \
-        .execute()
-    if current_branch_resp.data:
-        messages = current_branch_resp.data[0]["messages"]
-    else:
-        msg_resp = supabase.table("messages") \
-            .select("id, content, sender, thinking_time, created_at") \
-            .eq("conversation_id", cid) \
-            .order("created_at", desc=False) \
+        if not msg_result.data:
+            raise HTTPException(status_code=404, detail="AI message not found")
+        
+        conv_id = msg_result.data[0]["conversation_id"]
+        
+        # Verify conversation ownership
+        conv_result = supabase.table("conversations")\
+            .select("id")\
+            .eq("id", conv_id)\
+            .eq("user_id", user_id)\
             .execute()
-        messages = msg_resp.data or []
+        
+        if not conv_result.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Get conversation history up to this message
+        history_result = supabase.table("messages")\
+            .select("*")\
+            .eq("conversation_id", conv_id)\
+            .lt("created_at", msg_result.data[0]["created_at"])\
+            .order("created_at", desc=False)\
+            .execute()
+        
+        # Convert to chat engine format
+        formatted_messages = []
+        for msg in history_result.data:
+            formatted_messages.append({
+                "role": msg["sender"],
+                "content": msg["content"]
+            })
+        
+        # Add system prompt if provided
+        if request.get("system_prompt"):
+            formatted_messages.insert(0, {
+                "role": "system",
+                "content": request["system_prompt"]
+            })
+        
+        # Generate new response
+        start_time = time.time()
+        ai_content, duration = await chat_answer(
+            messages=formatted_messages,
+            conversation_id=conv_id,
+            model=request.get("model", "gemma3:latest"),
+            preset=request.get("preset", "CFIR"),
+            temperature=request.get("temperature", 0.7),
+            user_id=user_id,
+            rag_method=request.get("rag_method", "No Specific RAG Method"),
+            retrieval_method=request.get("retrieval_method", "local context only")
+        )
+        
+        actual_duration = int((time.time() - start_time) * 1000)
+        
+        # Update the message
+        result = supabase.table("messages")\
+            .update({
+                "content": ai_content,
+                "thinking_time": actual_duration,
+                "model": request.get("model"),
+                "preset": request.get("preset"),
+                "temperature": request.get("temperature"),
+                "rag_method": request.get("rag_method"),
+                "retrieval_method": request.get("retrieval_method"),
+                "updated_at": datetime.utcnow().isoformat()
+            })\
+            .eq("id", message_id)\
+            .execute()
+        row = result.data[0]
+        if result.data:
+            updated_msg = Message(
+                id=message_id,
+                conversation_id=conv_id,
+                sender="ai",
+                content=ai_content,
+                thinking_time=actual_duration,
+                feedback=None,
+                model=request.get("model"),
+                preset=request.get("preset"),
+                temperature=request.get("temperature"),
+                rag_method=request.get("rag_method"),
+                retrieval_method=request.get("retrieval_method"),
+                created_at=datetime.fromisoformat(row["created_at"])
+            )
+            return updated_msg
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update message")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error regenerating message: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate message: {str(e)}")
 
-    # ensure conversation_id on every message and convert field names
-    for m in messages:
-        m["conversation_id"] = cid
-        if "thinking_time" in m:
-            m["thinkingTime"] = m.pop("thinking_time")
+@router.post("/title")
+async def generate_title(
+    req: TitleRequest,
+    user_id: Optional[str] = Depends(get_current_user)
+):
+    prompt = (
+         f'Generate a concise chat title using EXACTLY 2-4 words.\n'
+         f'User asked: "{req.user_message}"\n'
+         f'AI: "{req.ai_response}"'
+    )
 
-    # fetch all branches for sidebar
-    branch_resp = supabase.table("branches") \
-        .select("id, edit_at_id, messages, is_original") \
-        .eq("conversation_id", cid) \
-        .order("created_at", desc=False) \
-        .execute()
-    branch_objs = branch_resp.data or []
+    MODEL_NAME = "qwen3:0.6b"
+    PRESET = "CFIR"
+    TEMP = 0.7
 
-    branches_by_edit: Dict[str, List[List[Message]]] = {}
-    for b in branch_objs:
-        edit_id = b["edit_at_id"]
-        for msg in b["messages"]:
-            msg["conversation_id"] = cid
-            if "thinking_time" in msg:
-                msg["thinkingTime"] = msg.pop("thinking_time")
-        branches_by_edit.setdefault(edit_id, []).append({
-            "messages": b["messages"],
-            "branchId": b["id"],
-            "isOriginal": b["is_original"]
-        })
+    # Generate title using the chat engine
+    title_html, _ = await chat_answer(
+        messages=[{"role": "user", "content": prompt}],
+        conversation_id=req.conversation_id,
+        model=MODEL_NAME,
+        preset=PRESET,
+        temperature=TEMP,
+        user_id=user_id,
+        rag_method="no-workflow",  # Use default strategy for title generation
+        retrieval_method="local context only"
+    )
 
-    current_index_map = { eid: len(lst) - 1 for eid, lst in branches_by_edit.items() }
+    clean = re.sub(
+        r'<think>[\s\S]*?<\/think>'
+        r'|<[^>]*>'
+        r'|["\']'
+        r'|The chat title could be:\s*'
+        r'|A Concise Chat Title Using Exactly 2-4 Words\.\s*',
+        "",
+        title_html,
+        flags=re.IGNORECASE,
+    ).strip() or "New chat"
 
-    # Get original messages from database (not from branches)
-    original_msg_resp = supabase.table("messages") \
-        .select("id, content, sender, thinking_time, created_at") \
-        .eq("conversation_id", cid) \
-        .order("created_at", desc=False) \
-        .execute()
-    original_messages = original_msg_resp.data or []
-    
-    # Convert field names for original messages
-    for msg in original_messages:
-        msg["conversation_id"] = cid
-        if "thinking_time" in msg:
-            msg["thinkingTime"] = msg.pop("thinking_time")
-
-    return {
-        "messages": messages,
-        "originalMessages": original_messages,
-        "branchesByEditId": branches_by_edit,
-        "currentBranchIndexByEditId": current_index_map,
-    }
+    print(f"DEBUG: generate_title: clean={clean}")
+    return {"title": clean}

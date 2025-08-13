@@ -39,8 +39,9 @@ class MessageCreate(MessageBase):
     top_p: Optional[float] = None
     rag_method: Optional[str] = None
     retrieval_method: Optional[str] = None
+    strategy: Optional[str] = None
 
-    model_config = ConfigDict(validate_by_name=True)
+    model_config = ConfigDict(validate_by_name=True, populate_by_name=True)
 
 class Message(MessageBase):
     id: str
@@ -49,13 +50,16 @@ class Message(MessageBase):
 
     model: Optional[str] = None
     preset: Optional[str] = None
+    system_prompt: Optional[str] = None
+    speculative_decoding: Optional[bool] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    strategy: Optional[str] = None
     rag_method: Optional[str] = None
     retrieval_method: Optional[str] = None
     created_at: datetime
 
-    model_config = ConfigDict(validate_by_name=True, from_attributes=True)
+    model_config = ConfigDict(validate_by_name=True, from_attributes=True, populate_by_name=True)
 
 class MessageUpdate(BaseModel):
     content: Optional[str] = None
@@ -73,7 +77,7 @@ class MessageUpdate(BaseModel):
 # ---- chat ----
 class ChatRequest(BaseModel):
     conversation_id: str
-    messages: List[MessageBase]
+    messages: List[MessageCreate]
     model: str
     preset: str
     rag_method: str
@@ -117,11 +121,11 @@ class FeedbackRequest(BaseModel):
 
 # ---- history ----
 class BranchItem(BaseModel):
-    branch_id: str = Field(..., alias="branchId")
+    branch_id: Optional[str] = Field(None, alias="branchId")
     is_original: bool = Field(..., alias="isOriginal")
     messages: List[Message]
 
-    model_config = ConfigDict(validate_by_name=True)
+    model_config = ConfigDict(validate_by_name=True, populate_by_name=True)
 
 class History(BaseModel):
     messages: List[Message]
@@ -130,4 +134,4 @@ class History(BaseModel):
     currentBranchIndexByEditId: Dict[str, int] = Field(..., alias="currentBranchIndexByEditId")
     activeBranchId: Optional[str] = Field(None, alias="activeBranchId")
 
-    model_config = ConfigDict(validate_by_name=True)
+    model_config = ConfigDict(validate_by_name=True, populate_by_name=True)

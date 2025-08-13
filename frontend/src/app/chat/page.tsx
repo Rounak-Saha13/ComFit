@@ -946,6 +946,43 @@ export default function ChatbotUI() {
       }
     }
 
+    // CRITICAL FIX: If we have branches but no main messages, use the active branch
+    if (
+      Object.keys(historyData.branchesByEditId).length > 0 &&
+      (!historyData.messages || historyData.messages.length === 0)
+    ) {
+      // Find the active branch and use its messages
+      for (const [editId, branches] of Object.entries(
+        historyData.branchesByEditId
+      )) {
+        const activeBranch = branches.find(
+          (b: any) => b.branchId === historyData.activeBranchId
+        );
+        if (activeBranch && activeBranch.messages) {
+          historyData.messages = activeBranch.messages;
+          console.log(
+            "DEBUG: loadHistory - Using active branch messages as main messages"
+          );
+          break;
+        }
+      }
+
+      // If still no messages, use the first available branch
+      if (!historyData.messages || historyData.messages.length === 0) {
+        for (const [editId, branches] of Object.entries(
+          historyData.branchesByEditId
+        )) {
+          if (branches.length > 0 && branches[0].messages) {
+            historyData.messages = branches[0].messages;
+            console.log(
+              "DEBUG: loadHistory - Using first branch messages as main messages"
+            );
+            break;
+          }
+        }
+      }
+    }
+
     // CRITICAL FIX: Set proper current branch indexes if missing
     for (const [editId, branches] of Object.entries(
       historyData.branchesByEditId
@@ -954,6 +991,17 @@ export default function ChatbotUI() {
         // Default to the last branch (usually the most recent)
         historyData.currentBranchIndexByEditId[editId] = branches.length - 1;
       }
+    }
+
+    // CRITICAL FIX: Ensure originalMessages always contains the true original conversation
+    // This should come from the main messages table, not from branches
+    if (historyData.messages && historyData.messages.length > 0) {
+      // The messages field should contain the main conversation flow
+      historyData.originalMessages = [...historyData.messages];
+      console.log(
+        "DEBUG: loadHistory - Set originalMessages from main messages:",
+        historyData.originalMessages.length
+      );
     }
 
     console.log("DEBUG: loadHistory - Final branch structure:", {
@@ -1030,6 +1078,44 @@ export default function ChatbotUI() {
       }
     }
 
+    // CRITICAL FIX: If we have branches but no main messages, use the active branch
+    let finalMessages = messages;
+    if (
+      Object.keys(processedBranchesByEditId).length > 0 &&
+      (!finalMessages || finalMessages.length === 0)
+    ) {
+      // Find the active branch and use its messages
+      for (const [editId, branches] of Object.entries(
+        processedBranchesByEditId
+      )) {
+        const activeBranch = branches.find(
+          (b: any) => b.branchId === activeBranchId
+        );
+        if (activeBranch && activeBranch.messages) {
+          finalMessages = activeBranch.messages;
+          console.log(
+            "DEBUG: handleConversationClick - Using active branch messages as main messages"
+          );
+          break;
+        }
+      }
+
+      // If still no messages, use the first available branch
+      if (!finalMessages || finalMessages.length === 0) {
+        for (const [editId, branches] of Object.entries(
+          processedBranchesByEditId
+        )) {
+          if (branches.length > 0 && branches[0].messages) {
+            finalMessages = branches[0].messages;
+            console.log(
+              "DEBUG: handleConversationClick - Using first branch messages as main messages"
+            );
+            break;
+          }
+        }
+      }
+    }
+
     console.log(
       "DEBUG: handleConversationClick - Processed branch structure:",
       {
@@ -1038,11 +1124,35 @@ export default function ChatbotUI() {
       }
     );
 
+    // CRITICAL FIX: Ensure originalMessages contains the true original conversation
+    // This should come from the main messages table, not from branches
+    let trueOriginalMessages = originalMessages;
+    if (finalMessages && finalMessages.length > 0) {
+      // If we're using branch messages as main messages, we need to ensure
+      // originalMessages contains the true original conversation
+      if (Object.keys(processedBranchesByEditId).length > 0) {
+        // Look for an original branch to get the true originals
+        for (const [editId, branches] of Object.entries(
+          processedBranchesByEditId
+        )) {
+          const originalBranch = branches.find((b: any) => b.isOriginal);
+          if (originalBranch && originalBranch.messages) {
+            trueOriginalMessages = originalBranch.messages;
+            console.log(
+              "DEBUG: handleConversationClick - Using original branch messages:",
+              trueOriginalMessages.length
+            );
+            break;
+          }
+        }
+      }
+    }
+
     setHistory((prev) => {
       const newHist = [...prev];
       newHist[idx] = {
-        messages: messages, // This contains the active branch messages from backend
-        originalMessages: originalMessages,
+        messages: finalMessages, // Use the final messages (may be from active branch)
+        originalMessages: trueOriginalMessages, // Use TRUE originals
         branchesByEditId: processedBranchesByEditId,
         currentBranchIndexByEditId: processedCurrentBranchIndexByEditId,
       };
@@ -1053,7 +1163,7 @@ export default function ChatbotUI() {
     setCurrentBranchId(activeBranchId);
 
     console.log("DEBUG: handleConversationClick - Updated history state:", {
-      messagesCount: messages.length,
+      messagesCount: finalMessages.length,
       branchesByEditIdKeys: Object.keys(processedBranchesByEditId),
       currentBranchId: activeBranchId,
     });
@@ -1076,7 +1186,7 @@ export default function ChatbotUI() {
     setCurrentIndex(0);
   };
 
-  // generate AI response using the selected model
+  // generate AI response using the selected model (saves to messages table)
   const generateAIResponse = async (messages: any[], model: string) => {
     console.log("DEBUG: generateAIResponse called");
     console.log("DEBUG: API_URL:", API_URL);
@@ -1160,6 +1270,71 @@ export default function ChatbotUI() {
     }
   };
 
+  // generate AI response locally for branches (doesn't save to messages table)
+  const generateAIResponseLocal = async (messages: any[], model: string) => {
+    console.log("DEBUG: generateAIResponseLocal called for branch");
+
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+
+    const payload = {
+      conversation_id: conversations[currentIndex].id,
+      messages: messages.map((m) => ({
+        id: m.id,
+        conversation_id: conversations[currentIndex].id,
+        sender: m.sender === "assistant" ? "ai" : m.sender,
+        content: m.content,
+        thinking_time: m.thinkingTime,
+        feedback: m.feedback,
+        model: selectedModel,
+        preset: preset,
+        system_prompt: systemPrompt,
+        speculative_decoding: specDecoding,
+        temperature: temperature,
+        top_p: topP,
+        strategy: strategy,
+        rag_method: selectedRagMethod,
+        retrieval_method: selectedRetrievalMethod,
+      })),
+      system_prompt: systemPrompt,
+      model: selectedModel,
+      temperature,
+      top_p: topP,
+      speculative_decoding: specDecoding,
+      strategy,
+      preset,
+      rag_method: selectedRagMethod,
+      retrieval_method: selectedRetrievalMethod,
+    };
+
+    if (session?.access_token) {
+      headers.Authorization = `Bearer ${session.access_token}`;
+    }
+
+    try {
+      const response = await fetch(`${API_URL}/api/chat`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `⚠️ Failed to generate AI response. Status: ${response.status}, Error: ${errorText}`
+        );
+      }
+
+      const responseData = await response.json();
+      // Return only the AI response text, not the full response object
+      return responseData.result;
+    } catch (error) {
+      console.error("DEBUG: Fetch error in generateAIResponseLocal:", error);
+      throw error;
+    }
+  };
+
   var limitReached = false;
   const hasMultipleBranches = (messageId: string): boolean => {
     const conv = history[currentIndex];
@@ -1172,13 +1347,12 @@ export default function ChatbotUI() {
         `DEBUG: hasMultipleBranches - message ${messageId} is an edit point with ${branches.length} branches:`,
         branches
       );
-      // CRITICAL FIX: Show navigation if there are multiple branches OR if there's an original + at least one branch
+
       const hasOriginal = branches.some((b: any) => b.isOriginal);
       const hasBranches = branches.some((b: any) => !b.isOriginal);
       return branches.length > 1 || (hasOriginal && hasBranches);
     }
 
-    // CRITICAL FIX: Add debugging for when branches exist but not for this message
     if (
       conv.branchesByEditId &&
       Object.keys(conv.branchesByEditId).length > 0
@@ -1203,11 +1377,16 @@ export default function ChatbotUI() {
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isAwaitingResponse) return;
 
+    // --- auth ---
     const {
       data: { session },
     } = await supabase.auth.getSession();
-    let conversationId: string;
+    if (session?.access_token) {
+      headers.Authorization = `Bearer ${session.access_token}`;
+    }
 
+    // --- conversation id (create if needed) ---
+    let conversationId: string;
     if (conversations.length === 0) {
       const newConversation = await handleNewChat();
       if (!newConversation) return;
@@ -1216,295 +1395,182 @@ export default function ChatbotUI() {
       conversationId = conversations[currentIndex].id;
     }
 
-    const userMessage: Message = {
-      id: uuidv4(),
-      content: inputValue,
-      sender: "user",
-      thinkingTime: 0, // User messages have no thinking time
+    // --- helpers for branch detection ---
+    const convState = history[currentIndex];
+
+    const branchExists = (bid?: string | null) => {
+      if (!bid) return false;
+      const groups = Object.values(convState.branchesByEditId || {}) as any[];
+      return groups.some((items: any[]) =>
+        items?.some((b) => b?.branchId === bid)
+      );
     };
 
-    setHistory((prev) => {
-      const copy = [...prev];
-      copy[currentIndex] = {
-        ...copy[currentIndex],
-        messages: [...copy[currentIndex].messages, userMessage],
-        editAtId: undefined,
-      };
-      return copy;
-    });
-    setInputValue("");
+    const findBranchById = (bid: string) => {
+      for (const [eid, items] of Object.entries(
+        convState.branchesByEditId || {}
+      )) {
+        const arr = items as any[];
+        const idx = arr.findIndex((b) => b?.branchId === bid);
+        if (idx !== -1) return { editId: eid, index: idx, branch: arr[idx] };
+      }
+      return null;
+    };
+
+    // --- build the user message (client shape) ---
+    const userMessage: Message = {
+      id: uuidv4(),
+      content: inputValue.trim(),
+      sender: "user",
+      thinkingTime: 0,
+    };
+
+    // decide routing mode
+    const validBranchSelected =
+      currentBranchId && branchExists(currentBranchId);
+    const found = validBranchSelected
+      ? findBranchById(currentBranchId as string)
+      : null;
+    const isOriginalBranch = !!(
+      found &&
+      found.branch &&
+      found.branch.isOriginal === true
+    );
+    const isBranchMode = !!(found && !isOriginalBranch);
+
+    // controller & UI state
     const controller = new AbortController();
     setAbortController(controller);
     setIsAwaitingResponse(true);
 
-    // Check if we're on a branch and if it's the original branch
-    let isOriginalBranch = false;
-    if (currentBranchId && history[currentIndex].branchesByEditId) {
-      for (const [editId, branches] of Object.entries(
-        history[currentIndex].branchesByEditId
-      )) {
-        const branch = branches.find((b) => b.branchId === currentBranchId);
-        if (branch && branch.isOriginal) {
-          isOriginalBranch = true;
-          break;
-        }
-      }
-    }
+    try {
+      // ======================
+      // BRANCH MODE (Option A)
+      // ======================
+      if (isBranchMode && found) {
+        const { editId, index, branch } = found;
+        const base: Message[] = Array.isArray(branch.messages)
+          ? branch.messages
+          : [];
 
-    // if its a branch (but not the original branch) and has a valid branchId
-    if (
-      currentBranchId &&
-      currentBranchId !== "original" &&
-      !isOriginalBranch
-    ) {
-      console.log(
-        "DEBUG: handleSendMessage - Processing branch message on branch:",
-        currentBranchId
-      );
+        // Generate AI on client using branch context + user message (don't save to messages table)
+        const messagesForAI = [...base, userMessage];
+        const aiResp = await generateAIResponseLocal(
+          messagesForAI,
+          selectedModel
+        );
 
-      // CRITICAL FIX: Verify we're on the correct branch before proceeding
-      const conv = history[currentIndex];
-      let targetBranchId = currentBranchId;
+        const newAi: Message = {
+          id: uuidv4(),
+          content: aiResp,
+          sender: "assistant",
+          thinkingTime: 0, // No thinking time for branches
+        };
 
-      // Double-check that currentBranchId matches an actual branch
-      if (conv.branchesByEditId) {
-        let foundBranch = false;
-        for (const [editId, branches] of Object.entries(
-          conv.branchesByEditId
-        )) {
-          for (const branch of branches) {
-            if (branch.branchId === currentBranchId) {
-              foundBranch = true;
-              console.log(
-                "DEBUG: handleSendMessage - Confirmed branch exists:",
-                {
-                  editId,
-                  branchId: currentBranchId,
-                  isOriginal: branch.isOriginal,
-                }
-              );
-              break;
-            }
+        const uiBranched = [...messagesForAI, newAi];
+
+        // Backend payload for PATCH /api/branches/{id}
+        const payload = uiBranched.map((m) => ({
+          ...toBackendMessage(m),
+          conversation_id: conversationId,
+          sender: m.sender === "assistant" ? "ai" : "user",
+        }));
+
+        const branchUpdateRes = await fetch(
+          `${API_URL}/api/branches/${currentBranchId}`,
+          {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify(payload),
           }
-          if (foundBranch) break;
-        }
-
-        if (!foundBranch) {
-          console.error(
-            "DEBUG: handleSendMessage - currentBranchId not found in branches, this will cause wrong branch targeting!"
+        );
+        if (!branchUpdateRes.ok) {
+          const body = await branchUpdateRes.text();
+          throw new Error(
+            `Branch update failed: ${branchUpdateRes.status} ${body}`
           );
         }
-      }
 
-      const messagesForAI = [
-        ...(history[currentIndex]?.messages || []),
-        userMessage,
-      ];
-      const { result: aiResp, duration } = await generateAIResponse(
-        messagesForAI,
-        selectedModel
-      );
+        // Update UI state: active chat view + the specific branch
+        setHistory((prev) => {
+          const copy = [...prev];
+          const c = copy[currentIndex];
 
-      const newAi: Message = {
-        id: uuidv4(),
-        content: aiResp,
-        sender: "assistant",
-        thinkingTime: duration,
-      };
+          const list = (c.branchesByEditId?.[editId] || []).slice();
+          list[index] = { ...list[index], messages: uiBranched };
 
-      const updatedBranchMessages = [...messagesForAI, newAi];
-      const backendMessages = updatedBranchMessages.map(toBackendMessage);
-
-      if (session?.access_token) {
-        headers.Authorization = `Bearer ${session.access_token}`;
-      }
-
-      // CRITICAL FIX: Save the updated branch messages to the backend
-      try {
-        // CRITICAL VERIFICATION: Double-check we're using the right branch ID
-        console.log("DEBUG: handleSendMessage - VERIFICATION:", {
-          currentBranchId,
-          targetBranchId,
-          areEqual: currentBranchId === targetBranchId,
-          messagesCount: backendMessages.length,
-        });
-
-        // CRITICAL FIX: Only update branch if we have a valid branch ID
-        if (
-          targetBranchId &&
-          targetBranchId !== "undefined" &&
-          targetBranchId !== "null"
-        ) {
-          console.log(
-            "DEBUG: handleSendMessage - Sending branch update to backend:",
-            {
-              branchId: targetBranchId,
-              messagesCount: backendMessages.length,
-              messages: backendMessages.map((m) => ({
-                id: m.id,
-                sender: m.sender,
-                contentLength: m.content?.length || 0,
-              })),
-            }
-          );
-
-          const branchUpdateRes = await fetch(
-            `${API_URL}/api/branches/${targetBranchId}`,
-            {
-              method: "PATCH",
-              headers,
-              body: JSON.stringify(backendMessages),
-            }
-          );
-
-          if (!branchUpdateRes.ok) {
-            const errorText = await branchUpdateRes.text();
-            console.error(
-              "Failed to update branch in backend:",
-              branchUpdateRes.status,
-              errorText
-            );
-            throw new Error(
-              `Failed to update branch: ${branchUpdateRes.status} - ${errorText}`
-            );
-          }
-
-          const updateResult = await branchUpdateRes.json();
-          console.log(
-            "DEBUG: handleSendMessage - Branch updated successfully in backend:",
-            updateResult
-          );
-        } else {
-          console.warn(
-            "DEBUG: handleSendMessage - Skipping branch update, invalid branch ID:",
-            targetBranchId
-          );
-        }
-      } catch (error) {
-        console.error("Error updating branch:", error);
-        // Continue with local update even if backend fails
-      }
-
-      setHistory((prev) => {
-        const copy = [...prev];
-        const conv = copy[currentIndex];
-        let found = false;
-        let editId = null;
-        let branchIdx = null;
-        if (conv.branchesByEditId) {
-          for (const [eid, branches] of Object.entries(conv.branchesByEditId)) {
-            const idx = branches.findIndex(
-              (b) => b.branchId === currentBranchId
-            );
-            if (idx !== -1) {
-              editId = eid;
-              branchIdx = idx;
-              found = true;
-              break;
-            }
-          }
-        }
-        if (found && editId !== null && branchIdx !== null) {
-          const updatedBranches = [...(conv.branchesByEditId?.[editId] || [])];
-          updatedBranches[branchIdx] = {
-            ...updatedBranches[branchIdx],
-            messages: updatedBranchMessages,
-          };
           copy[currentIndex] = {
-            ...conv,
-            // Update both the branch and the main messages field to keep them in sync
-            messages: updatedBranchMessages,
+            ...c,
+            messages: uiBranched, // show active branch in the chat pane
             branchesByEditId: {
-              ...conv.branchesByEditId,
-              [editId]: updatedBranches,
+              ...(c.branchesByEditId || {}),
+              [editId]: list,
             },
           };
+          return copy;
+        });
 
-          // CRITICAL: Also update localStorage to persist the updated branch
-          try {
-            const currentConversation = conversations[currentIndex];
-            if (currentConversation) {
-              localStorage.setItem(
-                `branches_${currentConversation.id}`,
-                JSON.stringify(copy[currentIndex].branchesByEditId)
-              );
-              console.log(
-                "DEBUG: handleSendMessage - Saved updated branches to localStorage"
-              );
-            }
-          } catch (error) {
-            console.error(
-              "DEBUG: handleSendMessage - Error saving to localStorage:",
-              error
-            );
-          }
-        } else {
-          // If not in a branch, update the main messages
-          copy[currentIndex] = {
-            ...conv,
-            messages: updatedBranchMessages,
-          };
-        }
+        // persist branches locally
+        try {
+          localStorage.setItem(
+            `branches_${conversationId}`,
+            JSON.stringify(
+              ((prev) => {
+                const c = history[currentIndex];
+                const list = (c.branchesByEditId?.[editId] || []).slice();
+                list[index] = { ...list[index], messages: uiBranched };
+                return { ...(c.branchesByEditId || {}), [editId]: list };
+              })()
+            )
+          );
+        } catch {}
+
+        // clear input + finish
+        setInputValue("");
+        setIsAwaitingResponse(false);
+        return;
+      }
+
+      // ======================
+      // MAINLINE MODE (/api/chat)
+      // ======================
+      // Optimistically render user message
+      setHistory((prev) => {
+        const copy = [...prev];
+        copy[currentIndex] = {
+          ...copy[currentIndex],
+          messages: [...copy[currentIndex].messages, userMessage],
+          editAtId: undefined,
+        };
         return copy;
       });
+      setInputValue("");
 
-      setIsAwaitingResponse(false);
-      return;
-    }
-
-    // normal flow - when not in a branch or when on the original branch
-    const messagesForAI = [
-      ...(history[currentIndex]?.messages || []),
-      userMessage,
-    ];
-
-    const payload = {
-      conversation_id: conversationId,
-      messages: [
-        ...(history[currentIndex]?.messages || []).map((m) => ({
-          id: m.id,
-          conversation_id: conversationId,
-          sender: m.sender,
-          content: m.content,
-          thinking_time: m.thinkingTime,
-          feedback: m.feedback,
-          model: selectedModel,
-          preset,
-          system_prompt: systemPrompt,
-          speculative_decoding: specDecoding,
-          temperature,
-          top_p: topP,
-          strategy,
-          rag_method: selectedRagMethod,
-          retrieval_method: selectedRetrievalMethod,
-        })),
-        {
-          id: userMessage.id,
-          conversation_id: conversationId,
-          sender: "user",
-          content: userMessage.content,
-          thinking_time: 0, // User messages have no thinking time
-        },
-      ],
-      system_prompt: systemPrompt,
-      model: selectedModel,
-      temperature,
-      top_p: topP,
-      speculative_decoding: specDecoding,
-      strategy,
-      preset,
-      rag_method: selectedRagMethod,
-      retrieval_method: selectedRetrievalMethod,
-    };
-
-    if (session?.access_token) {
-      headers.Authorization = `Bearer ${session.access_token}`;
-    }
-    try {
-      console.log("DEBUG: Sending chat request to:", `${API_URL}/api/chat`);
-      console.log("DEBUG: Chat payload:", payload);
-      console.log("DEBUG: Selected model in payload:", payload.model);
-      console.log("DEBUG: Selected model state:", selectedModel);
+      // Build ChatRequest payload
+      const prior = history[currentIndex]?.messages || [];
+      const payload = {
+        conversation_id: conversationId,
+        messages: [
+          ...prior.map((m) => ({
+            ...toBackendMessage(m),
+            conversation_id: conversationId,
+            // preserve sender mapping as-is; backend normalizes again
+          })),
+          {
+            ...toBackendMessage(userMessage),
+            conversation_id: conversationId,
+          },
+        ],
+        system_prompt: systemPrompt,
+        model: selectedModel,
+        temperature,
+        top_p: topP,
+        speculative_decoding: specDecoding,
+        strategy,
+        preset,
+        rag_method: selectedRagMethod,
+        retrieval_method: selectedRetrievalMethod,
+      };
 
       const res = await fetch(`${API_URL}/api/chat`, {
         method: "POST",
@@ -1513,172 +1579,70 @@ export default function ChatbotUI() {
         signal: controller.signal,
       });
 
-      console.log("DEBUG: Chat response status:", res.status);
-      console.log(
-        "DEBUG: Chat response headers:",
-        Object.fromEntries(res.headers.entries())
-      );
-
-      // rate limit pop up
       if (res.status === 429) {
-        console.log("DEBUG: Rate limit reached");
         limitReached = true;
         setShowLimitModal(true);
         return;
       }
-
       if (!res.ok) {
-        const errorText = await res.text();
-        console.error("DEBUG: Chat API error response:", errorText);
-        throw new Error(`Chat API error: ${res.status} - ${errorText}`);
+        const text = await res.text();
+        throw new Error(`Chat API error: ${res.status} - ${text}`);
       }
 
       const responseData = await res.json();
-      console.log("DEBUG: Chat response data:", responseData);
       const { result: aiText, duration, ai_message } = responseData;
-      console.log("DEBUG: AI message from response:", ai_message);
-      console.log(
-        "DEBUG: AI message thinking_time:",
-        ai_message?.thinking_time
-      );
-      console.log("DEBUG: Duration from response:", duration);
-      const newMessage = {
+
+      const newMessage: Message = {
         id: ai_message.id,
         content: ai_message.content,
-        sender: ai_message.sender === "ai" ? "assistant" : ai_message.sender, // Convert "ai" back to "assistant" for frontend
-        thinkingTime: ai_message.thinking_time || duration || 0, // Ensure this is never null
+        sender: ai_message.sender === "ai" ? "assistant" : ai_message.sender,
+        thinkingTime: ai_message?.thinking_time ?? duration ?? 0,
       };
-      console.log("DEBUG: New message being added:", newMessage);
 
       setHistory((prev) => {
         const copy = [...prev];
-        const updatedMessages = [...copy[currentIndex].messages, newMessage];
+        const updated = [...copy[currentIndex].messages, newMessage];
 
-        // Always update the main messages field first
         copy[currentIndex] = {
           ...copy[currentIndex],
-          messages: updatedMessages,
+          messages: updated,
           editAtId: undefined,
         };
-
-        // CRITICAL FIX: Always update branch messages when on any branch (but not original with null branchId)
-        if (
-          currentBranchId &&
-          currentBranchId !== "original" &&
-          copy[currentIndex].branchesByEditId
-        ) {
-          let found = false;
-          let editId = null;
-          let branchIdx = null;
-
-          for (const [eid, branches] of Object.entries(
-            copy[currentIndex].branchesByEditId
-          )) {
-            const idx = branches.findIndex(
-              (b) => b.branchId === currentBranchId
-            );
-            if (idx !== -1) {
-              editId = eid;
-              branchIdx = idx;
-              found = true;
-              break;
-            }
-          }
-
-          if (found && editId !== null && branchIdx !== null) {
-            const updatedBranches = [
-              ...(copy[currentIndex].branchesByEditId?.[editId] || []),
-            ];
-            updatedBranches[branchIdx] = {
-              ...updatedBranches[branchIdx],
-              messages: updatedMessages,
-            };
-            copy[currentIndex].branchesByEditId[editId] = updatedBranches;
-
-            console.log("DEBUG: handleSendMessage - Updated branch messages:", {
-              editId,
-              branchIdx,
-              branchId: currentBranchId,
-              messagesCount: updatedMessages.length,
-              isOriginal: updatedBranches[branchIdx].isOriginal,
-              branchMessagesCount: updatedBranches[branchIdx].messages.length,
-            });
-
-            // CRITICAL: Also update localStorage to persist the updated branch
-            try {
-              const currentConversation = conversations[currentIndex];
-              if (currentConversation) {
-                localStorage.setItem(
-                  `branches_${currentConversation.id}`,
-                  JSON.stringify(copy[currentIndex].branchesByEditId)
-                );
-                console.log(
-                  "DEBUG: handleSendMessage - Saved updated branches to localStorage"
-                );
-              }
-            } catch (error) {
-              console.error(
-                "DEBUG: handleSendMessage - Error saving to localStorage:",
-                error
-              );
-            }
-          }
-        }
-
-        console.log(
-          "DEBUG: Updated history with new message:",
-          copy[currentIndex].messages
-        );
-        console.log(
-          "DEBUG: Last message thinking time:",
-          copy[currentIndex].messages[copy[currentIndex].messages.length - 1]
-            ?.thinkingTime
-        );
         return copy;
       });
 
-      setIsAwaitingResponse(false);
-
-      // title generation for first message
-      const wasFirst = history[currentIndex]?.messages.length === 0;
-      if (session?.access_token) {
-        headers.Authorization = `Bearer ${session.access_token}`;
-      }
+      // Title generation (first turn)
+      const wasFirst = prior.length === 0;
       if (wasFirst) {
         const titleRes = await fetch(`${API_URL}/api/title`, {
           method: "POST",
           headers,
           body: JSON.stringify({
-            conversation_id: conversations[currentIndex].id,
+            conversation_id: conversationId,
             user_message: userMessage.content,
             ai_response: aiText,
           }),
         });
-        const { title: finalTitle } = await titleRes.json();
-        // Update local list
-        setConversations((prev) =>
-          prev.map((c, i) =>
-            i === currentIndex ? { ...c, title: finalTitle } : c
-          )
-        );
-
-        // Persist the new title
-        if (session?.access_token) {
-          headers.Authorization = `Bearer ${session.access_token}`;
+        if (titleRes.ok) {
+          const { title: finalTitle } = await titleRes.json();
+          setConversations((prev) =>
+            prev.map((c, i) =>
+              i === currentIndex ? { ...c, title: finalTitle } : c
+            )
+          );
+          await fetch(`${API_URL}/api/conversations/${conversationId}`, {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({ title: finalTitle }),
+          });
         }
-        await fetch(`${API_URL}/api/conversations/${conversationId}`, {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({ title: finalTitle }),
-        });
       }
 
       moveConversationToTop(currentIndex);
     } catch (err: any) {
-      if (err.name === "AbortError") {
-        return;
+      if (err?.name !== "AbortError") {
+        console.error("Error in handleSendMessage:", err);
       }
-      console.error("Error in handleSendMessage:", err);
     } finally {
       setAbortController(null);
       setIsAwaitingResponse(false);
@@ -1736,17 +1700,13 @@ export default function ChatbotUI() {
           },
         });
 
-        // Message not found - this could cause issues when trying to commit the edit
         console.warn("DEBUG: startEdit - Message not found, edit may fail");
-        // Continue anyway as the user might want to try
       }
     }
 
-    // CRITICAL FIX: Clear any existing edit state to prevent conflicts
     setEditingId(null);
     setEditingText("");
 
-    // CRITICAL FIX: Use setTimeout to ensure state is cleared before setting new values
     setTimeout(() => {
       setEditingId(messageId);
       setEditingText(currentContent);
@@ -1772,68 +1732,119 @@ export default function ChatbotUI() {
       thinkingTime: undefined,
     };
   }
+
   // branch logic
   const commitEdit = async (messageId: string) => {
-    // CRITICAL FIX: Prevent multiple simultaneous edits
+    // prevent parallel edits
     if (isAwaitingResponse) {
-      console.warn(
-        "DEBUG: commitEdit - Already processing edit, ignoring duplicate call"
-      );
+      console.warn("DEBUG: commitEdit - Already processing edit, ignoring");
       return;
     }
 
     const trimmed = editingText.trim();
     if (!trimmed) return;
 
-    const originalMessages =
-      history[currentIndex].originalMessages || history[currentIndex].messages;
-    const msgIdx = originalMessages.findIndex((m) => m.id === messageId);
-    if (msgIdx === -1) return;
-    const original = originalMessages[msgIdx].content;
-    const hasChanged = trimmed !== original;
+    const conv = history[currentIndex];
+    const convId = conversations[currentIndex].id;
 
+    let trueOriginalMessages: Message[];
+    if (conv.originalMessages && conv.originalMessages.length > 0) {
+      // Use originalMessages if available
+      trueOriginalMessages = conv.originalMessages;
+    } else {
+      // Fallback to current messages (this should be the main conversation)
+      trueOriginalMessages = conv.messages;
+    }
+
+    const msgIdx = trueOriginalMessages.findIndex((m) => m.id === messageId);
+    if (msgIdx === -1) return;
+
+    const originalMessageContent = trueOriginalMessages[msgIdx].content;
+    console.log(
+      "DEBUG: commitEdit - Original message content:",
+      originalMessageContent.substring(0, 50) + "..."
+    );
+    console.log(
+      "DEBUG: commitEdit - New edited content:",
+      trimmed.substring(0, 50) + "..."
+    );
+
+    // UI: build messages up to the edited one (inclusive) and replace content
+    const messagesUpToEdit = trueOriginalMessages
+      .slice(0, msgIdx + 1)
+      .map((m) => (m.id === messageId ? { ...m, content: trimmed } : m));
+
+    // clear edit UI
     setEditingId(null);
     setEditingText("");
-
-    // create a new branch with the edited content
-    const updatedOriginalMsgs = [...originalMessages];
-    updatedOriginalMsgs[msgIdx] = {
-      ...updatedOriginalMsgs[msgIdx],
-      content: trimmed,
-    };
-
-    // Set loading state before making API calls
     setIsAwaitingResponse(true);
 
     try {
+      // auth
       const {
         data: { session },
       } = await supabase.auth.getSession();
-
-      // Set authorization header for API calls
       if (session?.access_token) {
         headers.Authorization = `Bearer ${session.access_token}`;
       }
 
-      // create a branch when editing
-      const messagesUpToEdit = updatedOriginalMsgs.slice(0, msgIdx + 1);
-
-      // get AI reply
-      const { result: aiResp, duration } = await generateAIResponse(
+      // get AI reply (branch response)
+      const aiResp = await generateAIResponseLocal(
         messagesUpToEdit,
         selectedModel
       );
+
       const newAi: Message = {
-        id: Date.now().toString(),
+        id: uuidv4(),
         content: aiResp,
         sender: "assistant",
-        thinkingTime: duration,
+        thinkingTime: 0, // TODO: track thinking time or add later in backend
       };
 
-      const branchedMessages = [...messagesUpToEdit, newAi];
-      const convId = conversations[currentIndex].id;
+      const uiBranchedMessages = [...messagesUpToEdit, newAi];
 
-      // Create branch using backend API
+      const backendOriginalMessages = trueOriginalMessages.map((m) => ({
+        ...toBackendMessage(m),
+        conversation_id: convId,
+        sender: m.sender === "assistant" ? "ai" : "user",
+      }));
+
+      const payloadMessages = uiBranchedMessages.map((m) => ({
+        ...toBackendMessage(m),
+        conversation_id: convId,
+        sender: m.sender === "assistant" ? "ai" : "user",
+      }));
+
+      console.log("DEBUG: commitEdit - Sending to backend:");
+      console.log(
+        "  - Original messages count:",
+        backendOriginalMessages.length
+      );
+      console.log("  - Branched messages count:", payloadMessages.length);
+      console.log("  - Edit point message ID:", messageId);
+
+      console.log(
+        "DEBUG: commitEdit - TRUE original messages (from messages table):"
+      );
+      trueOriginalMessages.forEach((msg, idx) => {
+        console.log(
+          `  Original ${idx}: ${msg.sender} - ${msg.content.substring(
+            0,
+            50
+          )}...`
+        );
+      });
+
+      console.log(
+        "DEBUG: commitEdit - Branched messages being sent to backend:"
+      );
+      payloadMessages.forEach((msg, idx) => {
+        console.log(
+          `  Branch ${idx}: ${msg.sender} - ${msg.content.substring(0, 50)}...`
+        );
+      });
+
+      // create branch
       const branchResponse = await fetch(
         `${API_URL}/api/messages/conversations/${convId}/branches`,
         {
@@ -1841,99 +1852,91 @@ export default function ChatbotUI() {
           headers,
           body: JSON.stringify({
             edit_at_id: messageId,
-            messages: branchedMessages,
+            messages: payloadMessages, // edited messages + new AI response
+            original_messages: backendOriginalMessages,
           }),
         }
       );
 
       if (!branchResponse.ok) {
         throw new Error(
-          `Failed to create branch: ${branchResponse.statusText}`
+          `Failed to create branch: ${branchResponse.status} ${branchResponse.statusText}`
         );
       }
 
-      const branchData = await branchResponse.json();
-      const newBranchId = branchData.branch_id;
+      const { branch_id } = await branchResponse.json();
 
-      // update state with proper branch structure
+      // build updated branch lists
+      const eid = messageId;
+      const existing = conv.branchesByEditId?.[eid] ?? [];
+      const updatedList: BranchItem[] = existing.length
+        ? [
+            ...existing,
+            {
+              messages: uiBranchedMessages,
+              branchId: branch_id,
+              isOriginal: false,
+            },
+          ]
+        : [
+            {
+              messages: trueOriginalMessages,
+              branchId: null,
+              isOriginal: true,
+            },
+            {
+              messages: uiBranchedMessages,
+              branchId: branch_id,
+              isOriginal: false,
+            },
+          ];
+
+      const updatedBranchesByEditId = {
+        ...(conv.branchesByEditId || {}),
+        [eid]: updatedList,
+      };
+      const updatedBranchIndexByEditId = {
+        ...(conv.currentBranchIndexByEditId || {}),
+        [eid]: updatedList.length - 1,
+      };
+
+      // update state with UI-shape messages
       setHistory((prev) => {
-        const newHist = [...prev];
-        const conv = newHist[currentIndex];
-        const eid = messageId;
-
-        // grab existing branches for this edit, default empty
-        const existing = conv.branchesByEditId?.[eid] ?? [];
-
-        const updatedList: BranchItem[] = existing.length
-          ? [
-              ...existing,
-              {
-                messages: branchedMessages,
-                branchId: newBranchId,
-                isOriginal: false,
-              },
-            ]
-          : [
-              { messages: originalMessages, branchId: null, isOriginal: true },
-              {
-                messages: branchedMessages,
-                branchId: newBranchId,
-                isOriginal: false,
-              },
-            ];
-
-        newHist[currentIndex] = {
+        const copy = [...prev];
+        copy[currentIndex] = {
           ...conv,
-          // CRITICAL FIX: Set messages to the new branch messages
-          messages: branchedMessages,
-          branchesByEditId: {
-            ...(conv.branchesByEditId || {}),
-            [eid]: updatedList,
-          },
-          currentBranchIndexByEditId: {
-            ...(conv.currentBranchIndexByEditId || {}),
-            [eid]: updatedList.length - 1,
-          },
-          originalMessages: originalMessages, // Keep original messages unchanged
+          messages: uiBranchedMessages,
+          branchesByEditId: updatedBranchesByEditId,
+          currentBranchIndexByEditId: updatedBranchIndexByEditId,
+          originalMessages: trueOriginalMessages, // keep TRUE originals (before edit)
         };
-        return newHist;
+        return copy;
       });
 
-      // set current branch ID to the new branch
-      setCurrentBranchId(newBranchId);
+      setCurrentBranchId(branch_id);
 
-      // save to localStorage for persistence
+      // persist to localStorage (use the computed updated maps, not state)
       try {
-        const currentConversation = conversations[currentIndex];
-        if (currentConversation) {
-          const updatedHistory = history[currentIndex];
-          localStorage.setItem(
-            `branches_${currentConversation.id}`,
-            JSON.stringify(updatedHistory.branchesByEditId)
-          );
-          localStorage.setItem(
-            `branch_indexes_${currentConversation.id}`,
-            JSON.stringify(updatedHistory.currentBranchIndexByEditId)
-          );
-          console.log(
-            "DEBUG: commitEdit - Saved new branch to localStorage:",
-            newBranchId
-          );
-        }
-      } catch (error) {
-        console.error(
-          "DEBUG: commitEdit - Error saving to localStorage:",
-          error
+        localStorage.setItem(
+          `branches_${convId}`,
+          JSON.stringify(updatedBranchesByEditId)
         );
+        localStorage.setItem(
+          `branch_indexes_${convId}`,
+          JSON.stringify(updatedBranchIndexByEditId)
+        );
+        console.log("DEBUG: commitEdit - Saved new branch:", branch_id);
+      } catch (err) {
+        console.error("DEBUG: commitEdit - localStorage error:", err);
       }
     } catch (error) {
       console.error("Error creating branch:", error);
-      // restore original state on error
+      // restore UI on error
       setHistory((prev) => {
         const copy = [...prev];
         copy[currentIndex] = {
           ...copy[currentIndex],
-          messages: originalMessages, // Restore original messages
+          messages: trueOriginalMessages,
         };
         return copy;
       });

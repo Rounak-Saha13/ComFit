@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import os
 
 # Import routes
-from routes import chat, conversations, messages, branches, documents
+from routes import chat, conversations, messages, branches, documents, models
 
 # Import database
 from database import create_tables
@@ -37,6 +37,7 @@ app.include_router(conversations.router, prefix="/api", tags=["conversations"])
 app.include_router(messages.router, prefix="/api", tags=["messages"])
 app.include_router(branches.router, prefix="/api", tags=["branches"])
 app.include_router(documents.router, prefix="/api", tags=["documents"])
+app.include_router(models.router, prefix="/api", tags=["models"])
 
 @app.on_event("startup")
 async def startup_event():

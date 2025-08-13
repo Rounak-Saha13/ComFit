@@ -1,116 +1,168 @@
+from fastapi import APIRouter, HTTPException, Depends, Header
+from typing import Optional, List
+from datetime import datetime
 import uuid
-import logging
-from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Optional
-from schemas import Conversation, ConversationCreate, ConversationResponse
-from database import supabase
-from auth import optional_verify_token
+
+from schemas import ConversationCreate, Conversation, ConversationResponse
+from database import supabase, supabase_auth
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
-@router.get("/conversations", response_model=List[Conversation])
-async def list_convos(user_id: Optional[str] = Depends(optional_verify_token)):
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    """Extract user ID from authorization header"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    
+    token = authorization.split(" ")[1]
     try:
-        if not user_id:
-            logger.info("list_convos: guest user, returning empty list")
-            return []
-        logger.debug("list_convos: fetching conversations for user_id=%s", user_id)
-        resp = (supabase.table("conversations") \
-            .select("*") \
-            .eq("user_id", user_id) \
-            .order("created_at", desc=True) \
-            .execute()
-        )
-        logger.debug("list_convos: query response: %s", resp)
-        return resp.data or []
+        # Verify the token and get user info
+        user = supabase_auth.auth.get_user(token)
+        return user.user.id
     except Exception as e:
-        logger.exception("list_convos: database error for user_id=%s", user_id)
-        raise HTTPException(500, f"Database error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-@router.post("/conversations", response_model=ConversationResponse)
-async def create_convo (
-    convo: ConversationCreate,
-    user_id: str = Depends(optional_verify_token),
+@router.post("/conversations")
+async def create_conversation(
+    request: ConversationCreate, 
+    user_id: str = Depends(get_current_user)
 ):
+    """Create a new conversation"""
     try:
         conversation_id = str(uuid.uuid4())
-        # persist if real user
-        if user_id:
-            logger.debug("create_convo: creating conversation for user_id=%s", user_id)
-            logger.debug("create_convo: payload=%s", convo)
-            row = {
-                "id": conversation_id,
-                "title": convo.title,
-                "user_id": user_id,
-            }
-            resp = supabase.table("conversations").insert(row).execute()
-            if not resp.data:
-                logger.error("create_convo: insert returned no data, resp=%s", resp)
-                raise HTTPException(500, "Failed to create conversation")
-            logger.info("create_convo: created conversation %s for user %s", conversation_id, user_id)
-            return resp.data[0]
+        conversation_data = {
+            "id": conversation_id,
+            "user_id": user_id,
+            "title": request.title or "New Chat",
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
         
-        # for guest user
-        logger.info("create_convo: guest user, returning ephemeral convo %s", conversation_id)
-        return ConversationResponse(
-            id=conversation_id,
-            title=convo.title,
-            user_id=None
-        )
+        result = supabase.table("conversations").insert(conversation_data).execute()
+        
+        if result.data:
+            return ConversationResponse(**result.data[0])
+        else:
+            raise HTTPException(status_code=500, detail="Failed to create conversation")
+            
     except Exception as e:
-        logger.exception("create_convos: error in creating conversation")
-        raise HTTPException(500, f"Database error: {str(e)}")
+        print(f"Error creating conversation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create conversation: {str(e)}")
 
-@router.patch("/conversations/{cid}", response_model=Conversation)
-async def rename_convo(
-    cid: str,
-    convo: ConversationCreate,
-    user_id: Optional[str] = Depends(optional_verify_token)
+@router.get("/conversations")
+async def get_conversations(user_id: str = Depends(get_current_user)):
+    """Get all conversations for the current user"""
+    try:
+        result = supabase.table("conversations")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .order("updated_at", desc=True)\
+            .execute()
+        
+        if result.data:
+            conversations = []
+            for conv in result.data:
+                conversations.append(ConversationResponse(**conv))
+            return conversations
+        else:
+            return []
+            
+    except Exception as e:
+        print(f"Error fetching conversations: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch conversations: {str(e)}")
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: str, 
+    user_id: str = Depends(get_current_user)
 ):
-    if not user_id:
-        logger.warning("rename_convo: guest user renaming %s to %s", cid, convo.title)
-        return Conversation(id=cid, title=convo.title, user_id=None)
+    """Get a specific conversation by ID"""
     try:
-        logger.debug("rename_convo: updating convo %s title to %s for user %s", cid, convo.title, user_id)
-        resp = (
-            supabase.table("conversations") \
-            .update({"title": convo.title}) \
-            .eq("id", cid) \
-            .eq("user_id", user_id) \
+        result = supabase.table("conversations")\
+            .select("*")\
+            .eq("id", conversation_id)\
+            .eq("user_id", user_id)\
             .execute()
-        )
-        if not resp.data:
-            logger.warning("rename_convo: convo not found or not owned by user %s", user_id)
-            raise HTTPException(404, "Conversation not found")
-        logger.info("rename_convo: renamed convo %s", cid)        
-        return resp.data[0]
+        
+        if result.data:
+            return ConversationResponse(**result.data[0])
+        else:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("rename_convo: error renaming convo %s for user %s", cid, user_id)
-        raise HTTPException(500, f"Database error: {str(e)}")
+        print(f"Error fetching conversation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch conversation: {str(e)}")
 
-@router.delete("/conversations/{cid}")
-async def delete_convo(cid: str, user_id: Optional[str] = Depends(optional_verify_token)):
+@router.patch("/conversations/{conversation_id}")
+async def update_conversation(
+    conversation_id: str,
+    request: ConversationCreate,
+    user_id: str = Depends(get_current_user)
+):
+    """Update a conversation (e.g., title)"""
     try:
-        logger.debug("delete_convo: deleting convo %s for user %s", cid, user_id)
-        resp = (
-            supabase.table("conversations") \
-            .delete() \
-            .eq("id", cid) \
-            .eq("user_id", user_id) \
+        # Verify ownership
+        conv_result = supabase.table("conversations")\
+            .select("id")\
+            .eq("id", conversation_id)\
+            .eq("user_id", user_id)\
             .execute()
-        )
-        logger.info("delete_convo: deleted convo %s", cid)
-        return {"detail": "deleted"}
+        
+        if not conv_result.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Update conversation
+        update_data = {
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        if request.title is not None:
+            update_data["title"] = request.title
+        
+        result = supabase.table("conversations")\
+            .update(update_data)\
+            .eq("id", conversation_id)\
+            .execute()
+        
+        if result.data:
+            return ConversationResponse(**result.data[0])
+        else:
+            raise HTTPException(status_code=500, detail="Failed to update conversation")
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("delete_convo: error deleting convo %s for user %s", cid, user_id)
-        raise HTTPException(500, f"Database error: {str(e)}")
-    
-# test for debugging
-@router.get("/test-db")
-async def test_db():
+        print(f"Error updating conversation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update conversation: {str(e)}")
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    user_id: str = Depends(get_current_user)
+):
+    """Delete a conversation and all its messages"""
     try:
-        resp = supabase.table("conversations").select("count").execute()
-        return {"status": "Database connection working", "response": str(resp)}
+        # Verify ownership
+        conv_result = supabase.table("conversations")\
+            .select("id")\
+            .eq("id", conversation_id)\
+            .eq("user_id", user_id)\
+            .execute()
+        
+        if not conv_result.data:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Delete conversation (messages and branches will be deleted via CASCADE)
+        result = supabase.table("conversations")\
+            .delete()\
+            .eq("id", conversation_id)\
+            .execute()
+        
+        return {"message": "Conversation deleted successfully"}
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"status": "Database connection failed", "error": str(e)}
+        print(f"Error deleting conversation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete conversation: {str(e)}")
