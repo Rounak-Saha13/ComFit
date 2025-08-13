@@ -6,9 +6,10 @@ from auth import optional_verify_token
 from database import supabase
 from typing import Optional
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import ollama
 from fastapi.encoders import jsonable_encoder
+import os
 
 router = APIRouter()
 
@@ -18,7 +19,7 @@ def check_guest_rate_limit(request: Request, user_id: Optional[str]):
     if user_id is not None:
         return
     ip = request.client.host
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=1)
     logs = [ts for ts in _guest_logs[ip] if ts >= cutoff]
     _guest_logs[ip] = logs
@@ -52,6 +53,7 @@ async def chat(
         "conversation_id": req.conversation_id,
         "sender": "user",
         "content": req.messages[-1].content,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     # only persist for real users
     if user_id and supabase:
@@ -95,7 +97,7 @@ async def chat(
     ai_row = {
         "id": ai_msg_id,
         "conversation_id": req.conversation_id,
-        "sender": "ai",
+        "sender": "ai",  # Database expects "ai", not "assistant"
         "content": ai_text,
         "thinking_time": duration,
         "model": req.model,
@@ -107,14 +109,16 @@ async def chat(
         "strategy": req.strategy,
         "rag_method": req.rag_method,
         "retrieval_method": req.retrieval_method,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     # return or persist
     if not user_id or not supabase:
         print("DEBUG: Returning response without database persistence (guest user or no database)")
         # Add created_at field for guest responses
-        from datetime import datetime
-        ai_row["created_at"] = datetime.utcnow().isoformat()
+        ai_row["created_at"] = datetime.now(timezone.utc).isoformat()
+        # Convert "ai" sender back to "assistant" for frontend compatibility
+        ai_row["sender"] = "assistant"
         return {"result": ai_text, "duration": duration, "ai_message": ai_row}
 
     try:
@@ -130,12 +134,43 @@ async def chat(
         print("DEBUG: AI record thinking_time:", ai_record.get("thinking_time"))
     except Exception as e:
         print(f"DEBUG: Database error saving AI message: {e}")
-        if "duplicate key" in str(e).lower():
+        
+        # Check for specific constraint violation
+        if "messages_sender_check" in str(e):
+            print("DEBUG: Constraint violation - messages_sender_check constraint prevents 'assistant' sender")
+            print("DEBUG: This is a database schema issue that needs to be fixed in Supabase dashboard")
+            print("DEBUG: Returning response without database record")
+            
+            # Convert field names for Pydantic model
+            ai_message = ai_row.copy()
+            if "thinking_time" in ai_message:
+                ai_message["thinkingTime"] = ai_message.pop("thinking_time")
+            # Convert "ai" sender back to "assistant" for frontend compatibility
+            if "sender" in ai_message and ai_message["sender"] == "ai":
+                ai_message["sender"] = "assistant"
+            return {"result": ai_text, "duration": duration, "ai_message": ai_message}
+        
+        elif "duplicate key" in str(e).lower():
             print("DEBUG: Duplicate key error - returning response without database record")
-            return {"result": ai_text, "duration": duration, "ai_message": ai_row}
+            # Convert field names for Pydantic model
+            ai_message = ai_row.copy()
+            if "thinking_time" in ai_message:
+                ai_message["thinkingTime"] = ai_message.pop("thinking_time")
+            # Convert "ai" sender back to "assistant" for frontend compatibility
+            if "sender" in ai_message and ai_message["sender"] == "ai":
+                ai_message["sender"] = "assistant"
+            return {"result": ai_text, "duration": duration, "ai_message": ai_message}
+        
         # For other database errors, return response without database record
         print("DEBUG: Database error - returning response without database record")
-        return {"result": ai_text, "duration": duration, "ai_message": ai_row}
+        # Convert field names for Pydantic model
+        ai_message = ai_row.copy()
+        if "thinking_time" in ai_message:
+            ai_message["thinkingTime"] = ai_message.pop("thinking_time")
+        # Convert "ai" sender back to "assistant" for frontend compatibility
+        if "sender" in ai_message and ai_message["sender"] == "ai":
+            ai_message["sender"] = "assistant"
+        return {"result": ai_text, "duration": duration, "ai_message": ai_message}
 
     print("DEBUG: Final response ai_message:", ai_record)
     
@@ -144,36 +179,19 @@ async def chat(
         print("DEBUG: thinking_time not found in ai_record, adding it")
         ai_record["thinking_time"] = duration
     
+    # Convert database field names to Pydantic model field names
+    if "thinking_time" in ai_record:
+        ai_record["thinkingTime"] = ai_record.pop("thinking_time")
+    
+    # Convert "ai" sender back to "assistant" for frontend compatibility
+    if "sender" in ai_record and ai_record["sender"] == "ai":
+        ai_record["sender"] = "assistant"
+    
     return {"result": ai_text, "duration": duration, "ai_message": ai_record}
 
 @router.get("/models", tags=["models"])
 async def list_models():
     print("DEBUG: Models endpoint called")
-    
-    # Check if placeholder mode is enabled
-    import os
-    use_placeholder_responses = os.getenv("USE_PLACEHOLDER_RESPONSES", "false").lower() == "true"
-    
-    if use_placeholder_responses:
-        print("DEBUG: Placeholder mode enabled - returning mock models")
-        # Return a list of common model names that would typically be available
-        mock_models = [
-            "llama3:latest",
-            "qwen2.5:latest", 
-            "qwen2.5:7b",
-            "qwen2.5:14b",
-            "qwen2.5:32b",
-            "llama3.1:latest",
-            "llama3.1:8b",
-            "llama3.1:70b",
-            "mistral:latest",
-            "mistral:7b",
-            "codellama:latest",
-            "codellama:7b",
-            "codellama:13b",
-            "codellama:34b"
-        ]
-        return {"models": mock_models}
     
     try:
         print("DEBUG: Attempting to call ollama.list()")

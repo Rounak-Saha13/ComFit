@@ -31,7 +31,7 @@ class MessageBase(BaseModel):
 
 class MessageCreate(MessageBase):
     id: str
-    thinking_time: Optional[int] = Field(None, alias="thinkingTime")
+    thinking_time: int = Field(..., alias="thinkingTime")  # Required field, not optional
     feedback: Optional[int] = None
     model: Optional[str] = None
     preset: Optional[str] = None # vector store
@@ -44,7 +44,7 @@ class MessageCreate(MessageBase):
 
 class Message(MessageBase):
     id: str
-    thinking_time: Optional[int] = Field(None, alias="thinkingTime")
+    thinking_time: int = Field(..., alias="thinkingTime")  # Required field, not optional
     feedback: Optional[int] = None
 
     model: Optional[str] = None
@@ -59,7 +59,7 @@ class Message(MessageBase):
 
 class MessageUpdate(BaseModel):
     content: Optional[str] = None
-    thinking_time: Optional[int] = Field(None, alias="thinkingTime")
+    thinking_time: Optional[int] = Field(None, alias="thinkingTime")  # Keep optional for updates
     feedback: Optional[int] = None
     model: Optional[str] = None
     preset: Optional[str] = None
@@ -117,14 +117,17 @@ class FeedbackRequest(BaseModel):
 
 # ---- history ----
 class BranchItem(BaseModel):
-    branch_id: Optional[str] = Field(None, alias="branchId")
+    branch_id: str = Field(..., alias="branchId")
+    is_original: bool = Field(..., alias="isOriginal")
     messages: List[Message]
 
     model_config = ConfigDict(validate_by_name=True)
 
 class History(BaseModel):
     messages: List[Message]
-    branches_by_edit_id: Dict[str, List[BranchItem]] = Field(..., alias="branchesByEditId")
-    current_branch_index_by_edit_id: Dict[str, int] = Field(..., alias="currentBranchIndexByEditId")
+    original_messages: List[Message] = Field(..., alias="originalMessages")
+    branchesByEditId: Dict[str, List[BranchItem]] = Field(..., alias="branchesByEditId")
+    currentBranchIndexByEditId: Dict[str, int] = Field(..., alias="currentBranchIndexByEditId")
+    activeBranchId: Optional[str] = Field(None, alias="activeBranchId")
 
     model_config = ConfigDict(validate_by_name=True)

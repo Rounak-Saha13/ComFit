@@ -20,49 +20,19 @@ load_dotenv()
 class ChatEngine:
     def __init__(self):
         # TODO: Remove this once we have a proper way to set the ollama base url
-        #self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://192.168.0.240:11434")
-        self.ollama_base_url = "http://192.168.0.240:11434"
+        self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://192.168.0.240:11434")
         print(f"DEBUG: ChatEngine initialized with ollama_base_url: {self.ollama_base_url}")
         self.default_model = "llama3:latest"
         
         # Initialize document manager
         self.document_manager = document_manager
         
-        # Temporary flag to bypass Ollama calls when network is unavailable
-        self.use_placeholder_responses = os.getenv("USE_PLACEHOLDER_RESPONSES", "false").lower() == "true"
-        if self.use_placeholder_responses:
-            print("DEBUG: Placeholder responses enabled - Ollama calls will be bypassed")
-        
-    def _generate_placeholder_response(self, user_message: str, context_memory: Dict[str, Any]) -> str:
-        """
-        Generate a placeholder response when Ollama is not available
-        """
-        # Extract some context to make the response more relevant
-        rag_method = context_memory.get("model_config", {}).get("rag_method", "No Specific RAG Method")
-        preset = context_memory.get("model_config", {}).get("preset", "CFIR")
-        
-        # Create a contextual placeholder response
-        if "comfort" in user_message.lower() or "fitting" in user_message.lower():
-            return f"[PLACEHOLDER RESPONSE] I understand you're asking about comfort and fitting. Based on the {preset} preset and {rag_method} method, I would typically provide detailed guidance on clothing comfort and fitting techniques. However, I'm currently operating in placeholder mode due to network connectivity issues. Please try again when the network connection is restored."
-        
-        elif "injury" in user_message.lower() or "medical" in user_message.lower():
-            return f"[PLACEHOLDER RESPONSE] I see you're asking about injury-related topics. Using the {preset} preset with {rag_method}, I would normally provide comprehensive information about injury assessment and management. Currently in placeholder mode - please reconnect to the network for full functionality."
-        
-        elif "?" in user_message:
-            return f"[PLACEHOLDER RESPONSE] That's an interesting question! With the {rag_method} approach and {preset} knowledge base, I would typically provide a detailed answer. Currently operating in placeholder mode due to network issues. Please try again when connected."
-        
-        else:
-            return f"[PLACEHOLDER RESPONSE] I received your message: '{user_message[:100]}{'...' if len(user_message) > 100 else ''}'. Using {rag_method} method with {preset} preset, I would normally process this request. Currently in placeholder mode - please restore network connection for full AI functionality."
+
         
     def validate_model(self, model_name: str) -> bool:
         """
         Validate if a model name is available in Ollama
         """
-        # If placeholder mode is enabled, always return True to avoid validation errors
-        if self.use_placeholder_responses:
-            print(f"DEBUG: Placeholder mode enabled - skipping model validation for {model_name}")
-            return True
-            
         try:
             import ollama
             import os
@@ -73,7 +43,7 @@ class ChatEngine:
         except Exception:
             return False
     
-    def _get_local_query_engine(self, preset: str = "default"):
+    def _get_local_query_engine(self, preset: str = "default", model_name: str | None = None):
         """
         Get a local query engine based on the preset.
         
@@ -83,10 +53,6 @@ class ChatEngine:
         Returns:
             Query engine instance or None if not available
         """
-        # If placeholder mode is enabled, return None to avoid any Ollama calls
-        if self.use_placeholder_responses:
-            print(f"DEBUG: Placeholder mode enabled - skipping query engine creation for preset: {preset}")
-            return None
             
         try:
             # First try to load from document manager (new structure)
@@ -124,7 +90,7 @@ class ChatEngine:
                         vector_store = DuckDBVectorStore.from_local(str(duckdb_file))
                         index = VectorStoreIndex.from_vector_store(vector_store)
                         
-                        llm = Ollama(model=self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
+                        llm = Ollama(model=model_name or self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
                         print(f"DEBUG: Loaded DuckDB vector store for preset: {preset}")
                         return index.as_query_engine(llm=llm)
                     except Exception as e:
@@ -141,7 +107,7 @@ class ChatEngine:
                         # Set OLLAMA_HOST environment variable to use the configured base URL
                         os.environ['OLLAMA_HOST'] = self.ollama_base_url
                         print(f"DEBUG: Set OLLAMA_HOST to: {self.ollama_base_url} for root vector store query engine")
-                        llm = Ollama(model=self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
+                        llm = Ollama(model=model_name or self.default_model, request_timeout=600.0, base_url=self.ollama_base_url)
                         print(f"DEBUG: Loaded existing vector store from root directory")
                         return index.as_query_engine(llm=llm)
                 except Exception as e:
@@ -264,11 +230,6 @@ class ChatEngine:
         """
         print(f"DEBUG: _process_default called with user_message: {user_message}")
         
-        # Check if placeholder mode is enabled
-        if self.use_placeholder_responses:
-            print("DEBUG: Using placeholder response mode")
-            return self._generate_placeholder_response(user_message, context_memory)
-        
         try:
             import ollama
             import os
@@ -335,8 +296,64 @@ class ChatEngine:
             try:
                 available_models = ollama.list()
                 print(f"DEBUG: Available models from Ollama: {available_models}")
+                
+                # Check if the specific model exists
+                # Handle both dictionary and object responses from ollama.list()
+                if hasattr(available_models, 'models'):
+                    # Object response (like your debug shows)
+                    # Filter out embedding models - keep only language models
+                    model_names = []
+                    for m in available_models.models:
+                        # Skip models that are clearly embedding models
+                        if hasattr(m, 'details') and hasattr(m.details, 'family'):
+                            family = m.details.family
+                            # Skip embedding model families
+                            if family in ['nomic-bert', 'sentence-transformers', 'all-MiniLM', 'all-mpnet']:
+                                print(f"DEBUG: Skipping embedding model: {m.model} (family: {family})")
+                                continue
+                        model_names.append(m.model)
+                elif isinstance(available_models, dict) and 'models' in available_models:
+                    # Dictionary response
+                    models_list = available_models['models']
+                    if models_list and hasattr(models_list[0], 'model'):
+                        # Apply same filtering for dictionary response
+                        model_names = []
+                        for m in models_list:
+                            if hasattr(m, 'details') and hasattr(m.details, 'family'):
+                                family = m.details.family
+                                if family in ['nomic-bert', 'sentence-transformers', 'all-MiniLM', 'all-mpnet']:
+                                    print(f"DEBUG: Skipping embedding model: {m.model} (family: {family})")
+                                    continue
+                            model_names.append(m.model)
+                    else:
+                        model_names = [m.get('name', str(m)) for m in models_list]
+                else:
+                    # Fallback: try to extract model names from whatever structure we get
+                    model_names = []
+                    if hasattr(available_models, '__iter__'):
+                        for item in available_models:
+                            if hasattr(item, 'model'):
+                                # Apply filtering here too if possible
+                                if hasattr(item, 'details') and hasattr(item.details, 'family'):
+                                    family = item.details.family
+                                    if family in ['nomic-bert', 'sentence-transformers', 'all-MiniLM', 'all-mpnet']:
+                                        print(f"DEBUG: Skipping embedding model: {item.model} (family: {family})")
+                                        continue
+                                model_names.append(item.model)
+                            elif isinstance(item, dict) and 'name' in item:
+                                model_names.append(item['name'])
+                            else:
+                                model_names.append(str(item))
+                
+                print(f"DEBUG: Extracted model names (filtered): {model_names}")
+                
+                if model not in model_names:
+                    print(f"DEBUG: Model {model} not found in available models: {model_names}")
+                    return f"Error: Model {model} is not available. Available models: {', '.join(model_names)}"
+                    
             except Exception as list_error:
                 print(f"DEBUG: Error listing models: {list_error}")
+                return f"Error: Could not connect to Ollama server. Please check if Ollama is running and accessible at {self.ollama_base_url}"
             
             response = ollama.chat(
                 model=model,
@@ -372,10 +389,6 @@ class ChatEngine:
         """
         Process using Planning Workflow
         """
-        # Check if placeholder mode is enabled
-        if self.use_placeholder_responses:
-            print("DEBUG: Using placeholder response mode for planning workflow")
-            return self._generate_placeholder_response(user_message, context_memory)
             
         try:
             # Import the RAG methods
@@ -486,10 +499,6 @@ class ChatEngine:
         """
         Process using Multi-Step Query Engine
         """
-        # Check if placeholder mode is enabled
-        if self.use_placeholder_responses:
-            print("DEBUG: Using placeholder response mode for multi-step query")
-            return self._generate_placeholder_response(user_message, context_memory)
             
         try:
             # Import the RAG methods
@@ -558,10 +567,6 @@ class ChatEngine:
         """
         Process using Multi-Strategy Workflow
         """
-        # Check if placeholder mode is enabled
-        if self.use_placeholder_responses:
-            print("DEBUG: Using placeholder response mode for multi-strategy workflow")
-            return self._generate_placeholder_response(user_message, context_memory)
             
         try:
             # Import the RAG methods
@@ -630,10 +635,6 @@ class ChatEngine:
         """
         Process using RAC Enhanced Hybrid RAG
         """
-        # Check if placeholder mode is enabled
-        if self.use_placeholder_responses:
-            print("DEBUG: Using placeholder response mode for RAC enhanced RAG")
-            return self._generate_placeholder_response(user_message, context_memory)
             
         try:
             # Import the RAG methods

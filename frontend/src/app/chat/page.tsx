@@ -56,22 +56,25 @@ import { v4 as uuidv4 } from "uuid";
 interface Message {
   id: string;
   content: string;
-  sender: "user" | "ai";
+  sender: "user" | "assistant" | "ai";
   thinkingTime?: number;
   feedback?: number | null;
   isThinking?: boolean;
+  created_at?: string;
+  conversation_id?: string;
 }
 
 interface BranchItem {
   messages: Message[];
-  branchId: string | null;
+  branchId: string | null; // null for original branch, string for real branches
+  isOriginal: boolean;
 }
 
 interface HistoryResponse {
   messages: Message[];
   branchesByEditId: Record<
     string,
-    Array<{ messages: Message[]; branchId: string }>
+    Array<{ messages: Message[]; branchId: string | null; isOriginal: boolean }>
   >;
   currentBranchIndexByEditId: Record<string, number>;
 }
@@ -86,6 +89,7 @@ interface ConversationState {
 
 interface LoadHistoryResult extends HistoryResponse {
   activeBranchId: string | null;
+  originalMessages: Message[];
 }
 
 export default function ChatbotUI() {
@@ -122,7 +126,137 @@ export default function ChatbotUI() {
   const [engineType, setEngineType] = useState<"chat" | "query">("chat");
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const currentMessages = history[currentIndex]?.messages || [];
+  // Get the currently active branch messages
+  const getCurrentBranchMessages = () => {
+    const conv = history[currentIndex];
+    if (!conv) return [];
+
+    console.log("DEBUG: getCurrentBranchMessages - conv:", {
+      hasMessages: !!conv.messages,
+      messagesCount: conv.messages?.length || 0,
+      hasBranches: !!conv.branchesByEditId,
+      branchesKeys: Object.keys(conv.branchesByEditId || {}),
+      currentBranchId,
+    });
+
+    // CRITICAL FIX: First, try to find the correct branch messages based on currentBranchId
+    if (
+      conv.branchesByEditId &&
+      Object.keys(conv.branchesByEditId).length > 0
+    ) {
+      // Look for the active branch by currentBranchId
+      if (currentBranchId) {
+        for (const [editId, branches] of Object.entries(
+          conv.branchesByEditId
+        )) {
+          for (const branch of branches) {
+            if (branch.branchId === currentBranchId) {
+              console.log(
+                "DEBUG: getCurrentBranchMessages - Found active branch by ID:",
+                {
+                  branchId: branch.branchId,
+                  messagesCount: branch.messages.length,
+                }
+              );
+              return branch.messages;
+            }
+          }
+        }
+      }
+
+      // If currentBranchId is null, look for the original branch
+      if (currentBranchId === null) {
+        for (const [editId, branches] of Object.entries(
+          conv.branchesByEditId
+        )) {
+          for (const branch of branches) {
+            if (branch.isOriginal) {
+              console.log(
+                "DEBUG: getCurrentBranchMessages - Found original branch:",
+                {
+                  branchId: branch.branchId,
+                  isOriginal: branch.isOriginal,
+                  messagesCount: branch.messages.length,
+                }
+              );
+              return branch.messages;
+            }
+          }
+        }
+
+        // CRITICAL FIX: If no original branch found but we have branches, use the first branch
+        // This handles the case where we're in the initial state
+        if (Object.keys(conv.branchesByEditId).length > 0) {
+          const firstEditId = Object.keys(conv.branchesByEditId)[0];
+          const firstBranches = conv.branchesByEditId[firstEditId];
+          if (firstBranches && firstBranches.length > 0) {
+            console.log(
+              "DEBUG: getCurrentBranchMessages - Using first available branch as fallback:",
+              {
+                editId: firstEditId,
+                branchId: firstBranches[0].branchId,
+                isOriginal: firstBranches[0].isOriginal,
+                messagesCount: firstBranches[0].messages.length,
+              }
+            );
+            return firstBranches[0].messages;
+          }
+        }
+      }
+
+      // CRITICAL FIX: If no active branch found, use the current branch index for each edit point
+      for (const [editId, branches] of Object.entries(conv.branchesByEditId)) {
+        const currentIdx = conv.currentBranchIndexByEditId?.[editId] ?? 0;
+        if (branches[currentIdx]) {
+          console.log(
+            "DEBUG: getCurrentBranchMessages - Using current branch index:",
+            {
+              editId,
+              currentIdx,
+              branchId: branches[currentIdx].branchId,
+              messagesCount: branches[currentIdx].messages.length,
+            }
+          );
+          return branches[currentIdx].messages;
+        }
+      }
+
+      // Fallback: use the first available branch
+      for (const [editId, branches] of Object.entries(conv.branchesByEditId)) {
+        if (branches.length > 0) {
+          console.log(
+            "DEBUG: getCurrentBranchMessages - Using first available branch:",
+            {
+              branchId: branches[0].branchId,
+              messagesCount: branches[0].messages.length,
+            }
+          );
+          return branches[0].messages;
+        }
+      }
+    }
+
+    // The main messages field should only be used as a last resort
+    // This is updated when switching branches or loading conversations
+    if (conv.messages && conv.messages.length > 0) {
+      console.log(
+        "DEBUG: getCurrentBranchMessages - Using main messages field as fallback:",
+        {
+          messagesCount: conv.messages.length,
+          firstMessage: conv.messages[0]?.content?.substring(0, 50) + "...",
+          lastMessage:
+            conv.messages[conv.messages.length - 1]?.content?.substring(0, 50) +
+            "...",
+        }
+      );
+      return conv.messages;
+    }
+
+    console.log("DEBUG: getCurrentBranchMessages - No messages found anywhere");
+    return [];
+  };
+
+  const currentMessages = getCurrentBranchMessages();
   const isWelcomeState = currentMessages.length === 0;
   const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -235,7 +369,10 @@ export default function ChatbotUI() {
   useEffect(() => {
     const initialHistory = conversations.map(() => ({
       messages: [],
+      originalMessages: [],
       editAtId: undefined,
+      branchesByEditId: {},
+      currentBranchIndexByEditId: {},
     }));
     setHistory(initialHistory);
     setCurrentIndex(0);
@@ -244,7 +381,7 @@ export default function ChatbotUI() {
   // hook for auto‐scroll to bottom whenever messages change
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [currentMessages]);
+  }, [currentMessages, currentBranchId]);
 
   // Autosize textbox when editing message
   useEffect(() => {
@@ -290,7 +427,15 @@ export default function ChatbotUI() {
           const newConvo = await handleNewChat();
           if (newConvo) {
             setConversations([newConvo]);
-            setHistory([{ messages: [], editAtId: undefined }]);
+            setHistory([
+              {
+                messages: [],
+                originalMessages: [],
+                editAtId: undefined,
+                branchesByEditId: {},
+                currentBranchIndexByEditId: {},
+              },
+            ]);
             setCurrentIndex(0);
           }
           return;
@@ -306,7 +451,13 @@ export default function ChatbotUI() {
           data.map((_, idx) =>
             idx === newIndex && prev[currentIndex]
               ? prev[currentIndex]
-              : { messages: [], editAtId: undefined }
+              : {
+                  messages: [],
+                  originalMessages: [],
+                  editAtId: undefined,
+                  branchesByEditId: {},
+                  currentBranchIndexByEditId: {},
+                }
           )
         );
         setCurrentIndex(Math.max(0, newIndex));
@@ -314,9 +465,14 @@ export default function ChatbotUI() {
         // Load the current conversation's history if it exists
         if (data.length > 0 && newIndex >= 0) {
           const currentConversation = data[newIndex];
+          console.log(
+            "DEBUG: loadConversations - Loading history for current conversation:",
+            currentConversation.id
+          );
           try {
             const {
               messages,
+              originalMessages,
               branchesByEditId = {},
               currentBranchIndexByEditId = {},
               activeBranchId,
@@ -324,7 +480,7 @@ export default function ChatbotUI() {
 
             // Backend already returns thinkingTime correctly, no conversion needed
             const convertedMessages = messages.map((msg: any) => {
-              if (msg.sender === "ai") {
+              if (msg.sender === "assistant") {
                 console.log("DEBUG: Loading AI message from backend:", {
                   id: msg.id,
                   thinkingTime: msg.thinkingTime,
@@ -341,14 +497,37 @@ export default function ChatbotUI() {
               );
             }
 
+            console.log("DEBUG: loadConversations - Setting history state:", {
+              newIndex,
+              messagesCount: convertedMessages.length,
+              originalMessagesCount: originalMessages.length,
+              branchesByEditIdKeys: Object.keys(convertedBranchesByEditId),
+            });
+            console.log(
+              "DEBUG: loadConversations - convertedBranchesByEditId:",
+              convertedBranchesByEditId
+            );
+            console.log(
+              "DEBUG: loadConversations - currentBranchIndexByEditId:",
+              currentBranchIndexByEditId
+            );
+
             setHistory((prev) => {
               const newHist = [...prev];
               newHist[newIndex] = {
                 messages: convertedMessages,
-                originalMessages: convertedMessages,
+                originalMessages: originalMessages,
                 branchesByEditId: convertedBranchesByEditId,
                 currentBranchIndexByEditId,
               };
+              console.log(
+                "DEBUG: loadConversations - Updated history state:",
+                newHist[newIndex]
+              );
+              console.log(
+                "DEBUG: loadConversations - branchesByEditId after set:",
+                newHist[newIndex].branchesByEditId
+              );
               return newHist;
             });
 
@@ -366,6 +545,26 @@ export default function ChatbotUI() {
     }
 
     loadConversations();
+
+    // Debug: Check localStorage for any saved branch information
+    console.log(
+      "DEBUG: useEffect triggered, checking localStorage for branches"
+    );
+    const keys = Object.keys(localStorage);
+    const branchKeys = keys.filter((key) => key.startsWith("branches_"));
+    const indexKeys = keys.filter((key) => key.startsWith("branch_indexes_"));
+    console.log("DEBUG: Found localStorage keys:", { branchKeys, indexKeys });
+
+    if (branchKeys.length > 0) {
+      branchKeys.forEach((key) => {
+        try {
+          const branches = JSON.parse(localStorage.getItem(key) || "{}");
+          console.log(`DEBUG: localStorage ${key}:`, branches);
+        } catch (error) {
+          console.error(`DEBUG: Error parsing localStorage ${key}:`, error);
+        }
+      });
+    }
   }, [user, loading]);
 
   // fetch models list
@@ -435,6 +634,19 @@ export default function ChatbotUI() {
     } catch (error) {
       console.error("Could not save feedback:", error);
     }
+  };
+
+  // auth helper
+  const getAuthHeaders = async () => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    return {
+      "Content-Type": "application/json",
+      ...(session?.access_token
+        ? { Authorization: `Bearer ${session.access_token}` }
+        : {}),
+    } as Record<string, string>;
   };
 
   const handleRegenerate = async (aiMessageId: string) => {
@@ -513,7 +725,7 @@ export default function ChatbotUI() {
             ? {
                 id: updatedMsg.id,
                 content: updatedMsg.content,
-                sender: "ai",
+                sender: "assistant",
                 thinkingTime: updatedMsg.thinking_time,
                 feedback: updatedMsg.feedback,
                 isThinking: false,
@@ -566,6 +778,11 @@ export default function ChatbotUI() {
   };
 
   const loadHistory = async (convId: string): Promise<LoadHistoryResult> => {
+    console.log(
+      "DEBUG: loadHistory - Loading history for conversation:",
+      convId
+    );
+
     const {
       data: { session },
     } = await supabase.auth.getSession();
@@ -582,53 +799,264 @@ export default function ChatbotUI() {
       }
     );
 
-    if (!res.ok) throw new Error("Failed to load history");
+    if (!res.ok) {
+      console.error(
+        "DEBUG: loadHistory - Failed to load history, status:",
+        res.status
+      );
+      throw new Error("Failed to load history");
+    }
 
-    const historyData = (await res.json()) as HistoryResponse;
-    // get active branchID
-    let activeBranchId: string | null = null;
-    for (const [editId, branchList] of Object.entries(
-      historyData.branchesByEditId
-    )) {
-      const idx = historyData.currentBranchIndexByEditId[editId];
-      if (branchList[idx]?.branchId) {
-        activeBranchId = branchList[idx].branchId;
-        break;
+    const historyData = (await res.json()) as LoadHistoryResult;
+
+    // Convert "ai" sender back to "assistant" for frontend compatibility
+    const convertSender = (msg: any) => {
+      if (msg.sender === "ai") {
+        return { ...msg, sender: "assistant" };
+      }
+      return msg;
+    };
+
+    // Convert all messages
+    if (historyData.messages) {
+      historyData.messages = historyData.messages.map(convertSender);
+    }
+    if (historyData.originalMessages) {
+      historyData.originalMessages =
+        historyData.originalMessages.map(convertSender);
+    }
+    if (historyData.branchesByEditId) {
+      for (const [editId, branches] of Object.entries(
+        historyData.branchesByEditId
+      )) {
+        for (const branch of branches) {
+          if (branch.messages) {
+            branch.messages = branch.messages.map(convertSender);
+          }
+        }
       }
     }
 
-    return {
-      ...historyData,
-      activeBranchId,
-    };
+    console.log("DEBUG: loadHistory - Received data:", {
+      messagesCount: historyData.messages?.length || 0,
+      originalMessagesCount: historyData.originalMessages?.length || 0,
+      branchesByEditIdKeys: Object.keys(historyData.branchesByEditId || {}),
+      activeBranchId: historyData.activeBranchId,
+    });
+
+    // CRITICAL FIX: Ensure we have proper branch structure
+    if (!historyData.branchesByEditId) {
+      historyData.branchesByEditId = {};
+    }
+    if (!historyData.currentBranchIndexByEditId) {
+      historyData.currentBranchIndexByEditId = {};
+    }
+
+    // If backend didn't return branches, try to load from localStorage
+    if (Object.keys(historyData.branchesByEditId).length === 0) {
+      console.log(
+        "DEBUG: loadHistory - No branches from backend, checking localStorage"
+      );
+      try {
+        const storedBranches = localStorage.getItem(`branches_${convId}`);
+        const storedIndexes = localStorage.getItem(`branch_indexes_${convId}`);
+
+        if (storedBranches) {
+          const parsedBranches = JSON.parse(storedBranches);
+          console.log(
+            "DEBUG: loadHistory - Found branches in localStorage:",
+            parsedBranches
+          );
+
+          // CRITICAL FIX: Properly merge localStorage branches with backend data
+          for (const [editId, branches] of Object.entries(parsedBranches)) {
+            if (!historyData.branchesByEditId[editId]) {
+              historyData.branchesByEditId[editId] = [];
+            }
+
+            // Add localStorage branches that don't exist in backend
+            for (const localStorageBranch of branches as any[]) {
+              const exists = historyData.branchesByEditId[editId].some(
+                (b: any) => b.branchId === localStorageBranch.branchId
+              );
+              if (!exists) {
+                historyData.branchesByEditId[editId].push(localStorageBranch);
+              }
+            }
+          }
+
+          if (storedIndexes) {
+            const parsedIndexes = JSON.parse(storedIndexes);
+            console.log(
+              "DEBUG: loadHistory - Found branch indexes in localStorage:",
+              parsedIndexes
+            );
+            historyData.currentBranchIndexByEditId = {
+              ...historyData.currentBranchIndexByEditId,
+              ...parsedIndexes,
+            };
+          }
+
+          console.log(
+            "DEBUG: loadHistory - Merged localStorage branches with backend data"
+          );
+        }
+      } catch (error) {
+        console.error(
+          "DEBUG: loadHistory - Error loading from localStorage:",
+          error
+        );
+      }
+    }
+
+    // CRITICAL FIX: Ensure we have an original branch for each edit point
+    for (const [editId, branches] of Object.entries(
+      historyData.branchesByEditId
+    )) {
+      const hasOriginal = branches.some((b: any) => b.isOriginal);
+      if (!hasOriginal && historyData.originalMessages.length > 0) {
+        // Create an original branch if it doesn't exist
+        const originalBranch = {
+          messages: historyData.originalMessages,
+          branchId: null, // null indicates original branch
+          isOriginal: true,
+        };
+        branches.unshift(originalBranch);
+        console.log(
+          `DEBUG: loadHistory - Created missing original branch for editId ${editId}`
+        );
+      }
+
+      // CRITICAL FIX: Ensure all branches have proper message structure
+      for (const branch of branches) {
+        if (branch.messages && Array.isArray(branch.messages)) {
+          console.log(
+            `DEBUG: loadHistory - Branch ${branch.branchId} (isOriginal: ${branch.isOriginal}) has ${branch.messages.length} messages`
+          );
+          // Log first few messages to debug
+          branch.messages.slice(0, 3).forEach((msg, idx) => {
+            console.log(`DEBUG: loadHistory - Message ${idx}:`, {
+              id: msg.id,
+              sender: msg.sender,
+              contentLength: msg.content?.length || 0,
+              hasThinkingTime: msg.thinkingTime != null,
+            });
+          });
+        }
+      }
+    }
+
+    // CRITICAL FIX: Set proper current branch indexes if missing
+    for (const [editId, branches] of Object.entries(
+      historyData.branchesByEditId
+    )) {
+      if (!(editId in historyData.currentBranchIndexByEditId)) {
+        // Default to the last branch (usually the most recent)
+        historyData.currentBranchIndexByEditId[editId] = branches.length - 1;
+      }
+    }
+
+    console.log("DEBUG: loadHistory - Final branch structure:", {
+      branchesByEditId: historyData.branchesByEditId,
+      currentBranchIndexByEditId: historyData.currentBranchIndexByEditId,
+      activeBranchId: historyData.activeBranchId,
+    });
+
+    return historyData;
   };
 
   // load messages immediately when convo is clicked
   const handleConversationClick = async (idx: number, convId: string) => {
     const {
       messages,
+      originalMessages,
       branchesByEditId = {},
       currentBranchIndexByEditId = {},
       activeBranchId,
     } = await loadHistory(convId);
 
-    // Backend already returns correct field names, no conversion needed
-    const convertedMessages = messages;
-    const convertedBranchesByEditId = branchesByEditId;
+    // Debug logging
+    console.log("DEBUG: handleConversationClick - received data:", {
+      messages,
+      originalMessages,
+      branchesByEditId,
+      currentBranchIndexByEditId,
+      activeBranchId,
+    });
+
+    // CRITICAL FIX: Save branch information to localStorage for persistence across refreshes
+    if (Object.keys(branchesByEditId).length > 0) {
+      localStorage.setItem(
+        `branches_${convId}`,
+        JSON.stringify(branchesByEditId)
+      );
+      localStorage.setItem(
+        `branch_indexes_${convId}`,
+        JSON.stringify(currentBranchIndexByEditId)
+      );
+      console.log(
+        "DEBUG: handleConversationClick - Saved branches to localStorage:",
+        branchesByEditId
+      );
+    }
+
+    // CRITICAL FIX: Ensure we have proper branch structure
+    const processedBranchesByEditId = { ...branchesByEditId };
+    const processedCurrentBranchIndexByEditId = {
+      ...currentBranchIndexByEditId,
+    };
+
+    // Ensure each edit point has an original branch
+    for (const [editId, branches] of Object.entries(
+      processedBranchesByEditId
+    )) {
+      const hasOriginal = branches.some((b: any) => b.isOriginal);
+      if (!hasOriginal && originalMessages.length > 0) {
+        // Create an original branch if it doesn't exist
+        const originalBranch = {
+          messages: originalMessages,
+          branchId: null, // null indicates original branch
+          isOriginal: true,
+        };
+        branches.unshift(originalBranch);
+        console.log(
+          `DEBUG: handleConversationClick - Created missing original branch for editId ${editId}`
+        );
+      }
+
+      // Set proper current branch index if missing
+      if (!(editId in processedCurrentBranchIndexByEditId)) {
+        processedCurrentBranchIndexByEditId[editId] = branches.length - 1;
+      }
+    }
+
+    console.log(
+      "DEBUG: handleConversationClick - Processed branch structure:",
+      {
+        branchesByEditId: processedBranchesByEditId,
+        currentBranchIndexByEditId: processedCurrentBranchIndexByEditId,
+      }
+    );
 
     setHistory((prev) => {
       const newHist = [...prev];
       newHist[idx] = {
-        messages: convertedMessages,
-        originalMessages: convertedMessages,
-        branchesByEditId: convertedBranchesByEditId,
-        currentBranchIndexByEditId,
+        messages: messages, // This contains the active branch messages from backend
+        originalMessages: originalMessages,
+        branchesByEditId: processedBranchesByEditId,
+        currentBranchIndexByEditId: processedCurrentBranchIndexByEditId,
       };
       return newHist;
     });
 
     setCurrentIndex(idx);
     setCurrentBranchId(activeBranchId);
+
+    console.log("DEBUG: handleConversationClick - Updated history state:", {
+      messagesCount: messages.length,
+      branchesByEditIdKeys: Object.keys(processedBranchesByEditId),
+      currentBranchId: activeBranchId,
+    });
   };
 
   // move conversation history
@@ -662,7 +1090,7 @@ export default function ChatbotUI() {
       messages: messages.map((m) => ({
         id: m.id,
         conversation_id: conversations[currentIndex].id,
-        sender: m.sender,
+        sender: m.sender === "assistant" ? "ai" : m.sender, // Convert "assistant" to "ai" for database
         content: m.content,
         thinking_time: m.thinkingTime,
         feedback: m.feedback,
@@ -735,7 +1163,41 @@ export default function ChatbotUI() {
   var limitReached = false;
   const hasMultipleBranches = (messageId: string): boolean => {
     const conv = history[currentIndex];
-    return (conv.branchesByEditId?.[messageId]?.length ?? 0) > 1;
+    if (!conv) return false;
+
+    // Check if this message is an edit point (has branches)
+    if (conv.branchesByEditId && conv.branchesByEditId[messageId]) {
+      const branches = conv.branchesByEditId[messageId];
+      console.log(
+        `DEBUG: hasMultipleBranches - message ${messageId} is an edit point with ${branches.length} branches:`,
+        branches
+      );
+      // CRITICAL FIX: Show navigation if there are multiple branches OR if there's an original + at least one branch
+      const hasOriginal = branches.some((b: any) => b.isOriginal);
+      const hasBranches = branches.some((b: any) => !b.isOriginal);
+      return branches.length > 1 || (hasOriginal && hasBranches);
+    }
+
+    // CRITICAL FIX: Add debugging for when branches exist but not for this message
+    if (
+      conv.branchesByEditId &&
+      Object.keys(conv.branchesByEditId).length > 0
+    ) {
+      console.log(
+        `DEBUG: hasMultipleBranches - message ${messageId} not found in branches, but branches exist:`,
+        {
+          messageId,
+          existingEditIds: Object.keys(conv.branchesByEditId),
+          branchesByEditId: conv.branchesByEditId,
+        }
+      );
+    }
+
+    // Only show navigation for edit points, not for messages within branches
+    console.log(
+      `DEBUG: hasMultipleBranches - message ${messageId} is not an edit point, no navigation needed`
+    );
+    return false;
   };
 
   const handleSendMessage = async () => {
@@ -758,6 +1220,7 @@ export default function ChatbotUI() {
       id: uuidv4(),
       content: inputValue,
       sender: "user",
+      thinkingTime: 0, // User messages have no thinking time
     };
 
     setHistory((prev) => {
@@ -774,8 +1237,65 @@ export default function ChatbotUI() {
     setAbortController(controller);
     setIsAwaitingResponse(true);
 
-    // if its a branch
-    if (currentBranchId) {
+    // Check if we're on a branch and if it's the original branch
+    let isOriginalBranch = false;
+    if (currentBranchId && history[currentIndex].branchesByEditId) {
+      for (const [editId, branches] of Object.entries(
+        history[currentIndex].branchesByEditId
+      )) {
+        const branch = branches.find((b) => b.branchId === currentBranchId);
+        if (branch && branch.isOriginal) {
+          isOriginalBranch = true;
+          break;
+        }
+      }
+    }
+
+    // if its a branch (but not the original branch) and has a valid branchId
+    if (
+      currentBranchId &&
+      currentBranchId !== "original" &&
+      !isOriginalBranch
+    ) {
+      console.log(
+        "DEBUG: handleSendMessage - Processing branch message on branch:",
+        currentBranchId
+      );
+
+      // CRITICAL FIX: Verify we're on the correct branch before proceeding
+      const conv = history[currentIndex];
+      let targetBranchId = currentBranchId;
+
+      // Double-check that currentBranchId matches an actual branch
+      if (conv.branchesByEditId) {
+        let foundBranch = false;
+        for (const [editId, branches] of Object.entries(
+          conv.branchesByEditId
+        )) {
+          for (const branch of branches) {
+            if (branch.branchId === currentBranchId) {
+              foundBranch = true;
+              console.log(
+                "DEBUG: handleSendMessage - Confirmed branch exists:",
+                {
+                  editId,
+                  branchId: currentBranchId,
+                  isOriginal: branch.isOriginal,
+                }
+              );
+              break;
+            }
+          }
+          if (foundBranch) break;
+        }
+
+        if (!foundBranch) {
+          console.error(
+            "DEBUG: handleSendMessage - currentBranchId not found in branches, this will cause wrong branch targeting!"
+          );
+        }
+      }
+
       const messagesForAI = [
         ...(history[currentIndex]?.messages || []),
         userMessage,
@@ -788,7 +1308,7 @@ export default function ChatbotUI() {
       const newAi: Message = {
         id: uuidv4(),
         content: aiResp,
-        sender: "ai",
+        sender: "assistant",
         thinkingTime: duration,
       };
 
@@ -798,11 +1318,72 @@ export default function ChatbotUI() {
       if (session?.access_token) {
         headers.Authorization = `Bearer ${session.access_token}`;
       }
-      await fetch(`${API_URL}/api/messages/branches/${currentBranchId}`, {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify(backendMessages),
-      });
+
+      // CRITICAL FIX: Save the updated branch messages to the backend
+      try {
+        // CRITICAL VERIFICATION: Double-check we're using the right branch ID
+        console.log("DEBUG: handleSendMessage - VERIFICATION:", {
+          currentBranchId,
+          targetBranchId,
+          areEqual: currentBranchId === targetBranchId,
+          messagesCount: backendMessages.length,
+        });
+
+        // CRITICAL FIX: Only update branch if we have a valid branch ID
+        if (
+          targetBranchId &&
+          targetBranchId !== "undefined" &&
+          targetBranchId !== "null"
+        ) {
+          console.log(
+            "DEBUG: handleSendMessage - Sending branch update to backend:",
+            {
+              branchId: targetBranchId,
+              messagesCount: backendMessages.length,
+              messages: backendMessages.map((m) => ({
+                id: m.id,
+                sender: m.sender,
+                contentLength: m.content?.length || 0,
+              })),
+            }
+          );
+
+          const branchUpdateRes = await fetch(
+            `${API_URL}/api/branches/${targetBranchId}`,
+            {
+              method: "PATCH",
+              headers,
+              body: JSON.stringify(backendMessages),
+            }
+          );
+
+          if (!branchUpdateRes.ok) {
+            const errorText = await branchUpdateRes.text();
+            console.error(
+              "Failed to update branch in backend:",
+              branchUpdateRes.status,
+              errorText
+            );
+            throw new Error(
+              `Failed to update branch: ${branchUpdateRes.status} - ${errorText}`
+            );
+          }
+
+          const updateResult = await branchUpdateRes.json();
+          console.log(
+            "DEBUG: handleSendMessage - Branch updated successfully in backend:",
+            updateResult
+          );
+        } else {
+          console.warn(
+            "DEBUG: handleSendMessage - Skipping branch update, invalid branch ID:",
+            targetBranchId
+          );
+        }
+      } catch (error) {
+        console.error("Error updating branch:", error);
+        // Continue with local update even if backend fails
+      }
 
       setHistory((prev) => {
         const copy = [...prev];
@@ -831,13 +1412,34 @@ export default function ChatbotUI() {
           };
           copy[currentIndex] = {
             ...conv,
+            // Update both the branch and the main messages field to keep them in sync
             messages: updatedBranchMessages,
             branchesByEditId: {
               ...conv.branchesByEditId,
               [editId]: updatedBranches,
             },
           };
+
+          // CRITICAL: Also update localStorage to persist the updated branch
+          try {
+            const currentConversation = conversations[currentIndex];
+            if (currentConversation) {
+              localStorage.setItem(
+                `branches_${currentConversation.id}`,
+                JSON.stringify(copy[currentIndex].branchesByEditId)
+              );
+              console.log(
+                "DEBUG: handleSendMessage - Saved updated branches to localStorage"
+              );
+            }
+          } catch (error) {
+            console.error(
+              "DEBUG: handleSendMessage - Error saving to localStorage:",
+              error
+            );
+          }
         } else {
+          // If not in a branch, update the main messages
           copy[currentIndex] = {
             ...conv,
             messages: updatedBranchMessages,
@@ -849,7 +1451,13 @@ export default function ChatbotUI() {
       setIsAwaitingResponse(false);
       return;
     }
-    // normal flow - when not in a branch
+
+    // normal flow - when not in a branch or when on the original branch
+    const messagesForAI = [
+      ...(history[currentIndex]?.messages || []),
+      userMessage,
+    ];
+
     const payload = {
       conversation_id: conversationId,
       messages: [
@@ -875,6 +1483,7 @@ export default function ChatbotUI() {
           conversation_id: conversationId,
           sender: "user",
           content: userMessage.content,
+          thinking_time: 0, // User messages have no thinking time
         },
       ],
       system_prompt: systemPrompt,
@@ -936,18 +1545,86 @@ export default function ChatbotUI() {
       const newMessage = {
         id: ai_message.id,
         content: ai_message.content,
-        sender: "ai" as const,
-        thinkingTime: ai_message.thinking_time || duration, // Fallback to duration if thinking_time is not available
+        sender: ai_message.sender === "ai" ? "assistant" : ai_message.sender, // Convert "ai" back to "assistant" for frontend
+        thinkingTime: ai_message.thinking_time || duration || 0, // Ensure this is never null
       };
       console.log("DEBUG: New message being added:", newMessage);
 
       setHistory((prev) => {
         const copy = [...prev];
+        const updatedMessages = [...copy[currentIndex].messages, newMessage];
+
+        // Always update the main messages field first
         copy[currentIndex] = {
           ...copy[currentIndex],
-          messages: [...copy[currentIndex].messages, newMessage],
+          messages: updatedMessages,
           editAtId: undefined,
         };
+
+        // CRITICAL FIX: Always update branch messages when on any branch (but not original with null branchId)
+        if (
+          currentBranchId &&
+          currentBranchId !== "original" &&
+          copy[currentIndex].branchesByEditId
+        ) {
+          let found = false;
+          let editId = null;
+          let branchIdx = null;
+
+          for (const [eid, branches] of Object.entries(
+            copy[currentIndex].branchesByEditId
+          )) {
+            const idx = branches.findIndex(
+              (b) => b.branchId === currentBranchId
+            );
+            if (idx !== -1) {
+              editId = eid;
+              branchIdx = idx;
+              found = true;
+              break;
+            }
+          }
+
+          if (found && editId !== null && branchIdx !== null) {
+            const updatedBranches = [
+              ...(copy[currentIndex].branchesByEditId?.[editId] || []),
+            ];
+            updatedBranches[branchIdx] = {
+              ...updatedBranches[branchIdx],
+              messages: updatedMessages,
+            };
+            copy[currentIndex].branchesByEditId[editId] = updatedBranches;
+
+            console.log("DEBUG: handleSendMessage - Updated branch messages:", {
+              editId,
+              branchIdx,
+              branchId: currentBranchId,
+              messagesCount: updatedMessages.length,
+              isOriginal: updatedBranches[branchIdx].isOriginal,
+              branchMessagesCount: updatedBranches[branchIdx].messages.length,
+            });
+
+            // CRITICAL: Also update localStorage to persist the updated branch
+            try {
+              const currentConversation = conversations[currentIndex];
+              if (currentConversation) {
+                localStorage.setItem(
+                  `branches_${currentConversation.id}`,
+                  JSON.stringify(copy[currentIndex].branchesByEditId)
+                );
+                console.log(
+                  "DEBUG: handleSendMessage - Saved updated branches to localStorage"
+                );
+              }
+            } catch (error) {
+              console.error(
+                "DEBUG: handleSendMessage - Error saving to localStorage:",
+                error
+              );
+            }
+          }
+        }
+
         console.log(
           "DEBUG: Updated history with new message:",
           copy[currentIndex].messages
@@ -1016,7 +1693,7 @@ export default function ChatbotUI() {
       const cancelMsg: Message = {
         id: uuidv4(),
         content: "Message cancelled",
-        sender: "ai",
+        sender: "assistant",
       };
       setHistory((prev) => {
         const copy = [...prev];
@@ -1033,8 +1710,47 @@ export default function ChatbotUI() {
 
   // Edit message
   const startEdit = (messageId: string, currentContent: string) => {
-    setEditingId(messageId);
-    setEditingText(currentContent);
+    console.log("DEBUG: startEdit - Starting edit for message:", {
+      messageId,
+      currentContentLength: currentContent.length,
+      currentIndex,
+      hasHistory: !!history[currentIndex],
+      messagesCount: history[currentIndex]?.messages?.length || 0,
+      originalMessagesCount:
+        history[currentIndex]?.originalMessages?.length || 0,
+    });
+
+    // Validate the message exists before starting edit
+    const conv = history[currentIndex];
+    if (conv) {
+      const messageExists =
+        conv.messages?.some((m) => m.id === messageId) ||
+        conv.originalMessages?.some((m) => m.id === messageId);
+
+      if (!messageExists) {
+        console.warn("DEBUG: startEdit - Message not found in current state:", {
+          messageId,
+          availableIds: {
+            messages: conv.messages?.map((m) => m.id) || [],
+            originalMessages: conv.originalMessages?.map((m) => m.id) || [],
+          },
+        });
+
+        // Message not found - this could cause issues when trying to commit the edit
+        console.warn("DEBUG: startEdit - Message not found, edit may fail");
+        // Continue anyway as the user might want to try
+      }
+    }
+
+    // CRITICAL FIX: Clear any existing edit state to prevent conflicts
+    setEditingId(null);
+    setEditingText("");
+
+    // CRITICAL FIX: Use setTimeout to ensure state is cleared before setting new values
+    setTimeout(() => {
+      setEditingId(messageId);
+      setEditingText(currentContent);
+    }, 0);
   };
 
   // Cancel editing
@@ -1050,13 +1766,22 @@ export default function ChatbotUI() {
 
   function toBackendMessage(msg: Message) {
     return {
-      content: msg.content,
-      thinking_time: msg.thinkingTime ?? null,
+      ...msg,
+      thinking_time: msg.thinkingTime,
       feedback: msg.feedback ?? null,
+      thinkingTime: undefined,
     };
   }
   // branch logic
   const commitEdit = async (messageId: string) => {
+    // CRITICAL FIX: Prevent multiple simultaneous edits
+    if (isAwaitingResponse) {
+      console.warn(
+        "DEBUG: commitEdit - Already processing edit, ignoring duplicate call"
+      );
+      return;
+    }
+
     const trimmed = editingText.trim();
     if (!trimmed) return;
 
@@ -1070,178 +1795,151 @@ export default function ChatbotUI() {
     setEditingId(null);
     setEditingText("");
 
-    // Update the message content in the original array
+    // create a new branch with the edited content
     const updatedOriginalMsgs = [...originalMessages];
     updatedOriginalMsgs[msgIdx] = {
       ...updatedOriginalMsgs[msgIdx],
       content: trimmed,
     };
 
-    setHistory((prev) => {
-      const copy = [...prev];
-      copy[currentIndex] = {
-        ...copy[currentIndex],
-        messages: updatedOriginalMsgs,
-      };
-      return copy;
-    });
+    // Set loading state before making API calls
     setIsAwaitingResponse(true);
 
-    const patchMsg = toBackendMessage(updatedOriginalMsgs[msgIdx]);
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    if (session?.access_token) {
-      headers.Authorization = `Bearer ${session.access_token}`;
-    }
-    await fetch(`${API_URL}/api/messages/${messageId}`, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify(patchMsg),
-    });
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
 
-    // Regenerate if message has not changed
-    if (!hasChanged) {
+      // Set authorization header for API calls
+      if (session?.access_token) {
+        headers.Authorization = `Bearer ${session.access_token}`;
+      }
+
+      // create a branch when editing
       const messagesUpToEdit = updatedOriginalMsgs.slice(0, msgIdx + 1);
-      setHistory((prev) => {
-        const copy = [...prev];
-        copy[currentIndex] = {
-          ...copy[currentIndex],
-          messages: messagesUpToEdit,
-        };
-        return copy;
-      });
 
+      // get AI reply
       const { result: aiResp, duration } = await generateAIResponse(
         messagesUpToEdit,
         selectedModel
       );
       const newAi: Message = {
-        id: uuidv4(),
+        id: Date.now().toString(),
         content: aiResp,
-        sender: "ai",
+        sender: "assistant",
         thinkingTime: duration,
       };
-      const regenerated = [...messagesUpToEdit, newAi];
 
+      const branchedMessages = [...messagesUpToEdit, newAi];
+      const convId = conversations[currentIndex].id;
+
+      // Create branch using backend API
+      const branchResponse = await fetch(
+        `${API_URL}/api/messages/conversations/${convId}/branches`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            edit_at_id: messageId,
+            messages: branchedMessages,
+          }),
+        }
+      );
+
+      if (!branchResponse.ok) {
+        throw new Error(
+          `Failed to create branch: ${branchResponse.statusText}`
+        );
+      }
+
+      const branchData = await branchResponse.json();
+      const newBranchId = branchData.branch_id;
+
+      // update state with proper branch structure
+      setHistory((prev) => {
+        const newHist = [...prev];
+        const conv = newHist[currentIndex];
+        const eid = messageId;
+
+        // grab existing branches for this edit, default empty
+        const existing = conv.branchesByEditId?.[eid] ?? [];
+
+        const updatedList: BranchItem[] = existing.length
+          ? [
+              ...existing,
+              {
+                messages: branchedMessages,
+                branchId: newBranchId,
+                isOriginal: false,
+              },
+            ]
+          : [
+              { messages: originalMessages, branchId: null, isOriginal: true },
+              {
+                messages: branchedMessages,
+                branchId: newBranchId,
+                isOriginal: false,
+              },
+            ];
+
+        newHist[currentIndex] = {
+          ...conv,
+          // CRITICAL FIX: Set messages to the new branch messages
+          messages: branchedMessages,
+          branchesByEditId: {
+            ...(conv.branchesByEditId || {}),
+            [eid]: updatedList,
+          },
+          currentBranchIndexByEditId: {
+            ...(conv.currentBranchIndexByEditId || {}),
+            [eid]: updatedList.length - 1,
+          },
+          originalMessages: originalMessages, // Keep original messages unchanged
+        };
+        return newHist;
+      });
+
+      // set current branch ID to the new branch
+      setCurrentBranchId(newBranchId);
+
+      // save to localStorage for persistence
+      try {
+        const currentConversation = conversations[currentIndex];
+        if (currentConversation) {
+          const updatedHistory = history[currentIndex];
+          localStorage.setItem(
+            `branches_${currentConversation.id}`,
+            JSON.stringify(updatedHistory.branchesByEditId)
+          );
+          localStorage.setItem(
+            `branch_indexes_${currentConversation.id}`,
+            JSON.stringify(updatedHistory.currentBranchIndexByEditId)
+          );
+          console.log(
+            "DEBUG: commitEdit - Saved new branch to localStorage:",
+            newBranchId
+          );
+        }
+      } catch (error) {
+        console.error(
+          "DEBUG: commitEdit - Error saving to localStorage:",
+          error
+        );
+      }
+    } catch (error) {
+      console.error("Error creating branch:", error);
+      // restore original state on error
       setHistory((prev) => {
         const copy = [...prev];
         copy[currentIndex] = {
           ...copy[currentIndex],
-          messages: regenerated,
+          messages: originalMessages, // Restore original messages
         };
         return copy;
       });
-
+    } finally {
       setIsAwaitingResponse(false);
-      return;
     }
-
-    const messagesUpToEdit = updatedOriginalMsgs.slice(0, msgIdx + 1);
-
-    // get AI reply
-    const { result: aiResp, duration } = await generateAIResponse(
-      messagesUpToEdit,
-      selectedModel
-    );
-    const newAi: Message = {
-      id: uuidv4(),
-      content: aiResp,
-      sender: "ai",
-      thinkingTime: duration,
-    };
-
-    // persist new AI message to Supabase
-    if (session?.access_token) {
-      headers.Authorization = `Bearer ${session.access_token}`;
-    }
-
-    const messageResponse = await fetch(`${API_URL}/api/messages/`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        id: newAi.id,
-        conversation_id: conversations[currentIndex].id,
-        sender: "ai",
-        content: newAi.content,
-        thinking_time: newAi.thinkingTime,
-        model: selectedModel,
-        preset: preset,
-        temperature: temperature,
-        top_p: topP,
-        rag_method: selectedRagMethod,
-        retrieval_method: selectedRetrievalMethod,
-      }),
-    });
-
-    if (!messageResponse.ok) {
-      console.error("Failed to save AI message:", await messageResponse.text());
-      throw new Error(`Failed to save AI message: ${messageResponse.status}`);
-    }
-
-    console.log("AI message saved successfully:", newAi.id);
-
-    // Small delay to ensure the message is fully committed to the database
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    const branchedMessages = [...messagesUpToEdit, newAi];
-    const convId = conversations[currentIndex].id;
-
-    // Use the backend API to create branches properly instead of direct Supabase insert
-    if (session?.access_token) {
-      headers.Authorization = `Bearer ${session.access_token}`;
-    }
-
-    const branchResponse = await fetch(
-      `${API_URL}/api/messages/conversations/${convId}/branches`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          edit_at_id: newAi.id, // Use the new AI message ID instead of the original message ID
-          messages: branchedMessages.map(toBackendMessage),
-        }),
-      }
-    );
-
-    if (!branchResponse.ok) {
-      throw new Error("Failed to create branch");
-    }
-
-    const { branch_id: newBranchId } = await branchResponse.json();
-
-    setHistory((prev) => {
-      const newHist = [...prev];
-      const conv = newHist[currentIndex];
-      const eid = newAi.id; // Use the new AI message ID as the edit ID
-
-      // grab existing branches for this edit, default empty
-      const existing = conv.branchesByEditId?.[eid] ?? [];
-
-      const updatedList: BranchItem[] = existing.length
-        ? [...existing, { messages: branchedMessages, branchId: newBranchId }]
-        : [
-            { messages: originalMessages, branchId: null },
-            { messages: branchedMessages, branchId: newBranchId },
-          ];
-
-      newHist[currentIndex] = {
-        ...conv,
-        messages: branchedMessages,
-        branchesByEditId: {
-          ...(conv.branchesByEditId || {}),
-          [eid]: updatedList,
-        },
-        currentBranchIndexByEditId: {
-          ...(conv.currentBranchIndexByEditId || {}),
-          [eid]: updatedList.length - 1,
-        },
-        originalMessages: originalMessages,
-      };
-      return newHist;
-    });
-    setCurrentBranchId(newBranchId);
-    setIsAwaitingResponse(false);
   };
 
   const activateBranch = async (branchId: string | null) => {
@@ -1471,7 +2169,13 @@ export default function ChatbotUI() {
 
     // initialize an empty message history slot for it
     setHistory((prev) => [
-      { messages: [], editAtId: undefined, branches: [], currentBranch: 0 },
+      {
+        messages: [],
+        originalMessages: [],
+        editAtId: undefined,
+        branchesByEditId: {},
+        currentBranchIndexByEditId: {},
+      },
       ...prev,
     ]);
     setCurrentIndex(0);
@@ -1513,7 +2217,15 @@ export default function ChatbotUI() {
         const newConvo = await handleNewChat();
         if (newConvo) {
           setConversations([newConvo]);
-          setHistory([{ messages: [], editAtId: undefined }]);
+          setHistory([
+            {
+              messages: [],
+              originalMessages: [],
+              editAtId: undefined,
+              branchesByEditId: {},
+              currentBranchIndexByEditId: {},
+            },
+          ]);
           setCurrentIndex(0);
         }
       } else {
@@ -1628,22 +2340,52 @@ export default function ChatbotUI() {
                 </div>
               </div>
               <button
-                onClick={() => setShowLeftSidebar(false)}
-                className="text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-1 rounded cursor-pointer transition-colors"
+                onClick={() => !isAwaitingResponse && setShowLeftSidebar(false)}
+                disabled={isAwaitingResponse}
+                className={`p-1 rounded transition-colors ${
+                  isAwaitingResponse
+                    ? "text-sidebar-foreground/50 cursor-not-allowed"
+                    : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Hide left sidebar"
+                }
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
             <button
               onClick={handleNewChat}
-              className="w-full flex items-center justify-start text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-2 rounded cursor-pointer transition-colors text-sm sm:text-base"
+              disabled={isAwaitingResponse}
+              className={`w-full flex items-center justify-start p-2 rounded transition-colors text-sm sm:text-base ${
+                isAwaitingResponse
+                  ? "text-sidebar-foreground/50 cursor-not-allowed"
+                  : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent cursor-pointer"
+              }`}
+              title={
+                isAwaitingResponse
+                  ? "Please wait for current operation to complete"
+                  : "Start a new chat"
+              }
             >
               <Plus className="w-4 h-4 mr-2" />
               New chat
             </button>
             <button
               onClick={() => setShowSearchModal(true)}
-              className="w-full flex items-center justify-start text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent p-2 rounded mt-2 cursor-pointer transition-colors text-sm sm:text-base"
+              disabled={isAwaitingResponse}
+              className={`w-full flex items-center justify-start p-2 rounded mt-2 transition-colors text-sm sm:text-base ${
+                isAwaitingResponse
+                  ? "text-sidebar-foreground/50 cursor-not-allowed"
+                  : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent cursor-pointer"
+              }`}
+              title={
+                isAwaitingResponse
+                  ? "Please wait for current operation to complete"
+                  : "Search through your chats"
+              }
             >
               <Search className="w-4 h-4 mr-2" />
               Search chats
@@ -1665,14 +2407,17 @@ export default function ChatbotUI() {
               conversations.map((conv, idx) => (
                 <div
                   key={conv.id}
-                  onClick={() => handleConversationClick(idx, conv.id)}
+                  onClick={() =>
+                    !isAwaitingResponse && handleConversationClick(idx, conv.id)
+                  }
                   className={`flex items-center justify-between p-2 rounded transition-colors
                     ${
                       idx === currentIndex
                         ? "bg-gray-700 text-white"
-                        : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
+                        : isAwaitingResponse
+                        ? "text-sidebar-foreground/50 cursor-not-allowed"
+                        : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent cursor-pointer"
                     }
-                    cursor-pointer
                   `}
                 >
                   {/* Title / Inline Input */}
@@ -1693,9 +2438,20 @@ export default function ChatbotUI() {
                     />
                   ) : (
                     <span
-                      className="text-xs sm:text-sm text-sidebar-foreground cursor-pointer truncate"
-                      onClick={() => handleConversationClick(idx, conv.id)}
-                      title={conv.title}
+                      className={`text-xs sm:text-sm truncate ${
+                        isAwaitingResponse
+                          ? "text-sidebar-foreground/50 cursor-not-allowed"
+                          : "text-sidebar-foreground cursor-pointer"
+                      }`}
+                      onClick={() =>
+                        !isAwaitingResponse &&
+                        handleConversationClick(idx, conv.id)
+                      }
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : conv.title
+                      }
                     >
                       {conv.title}
                     </span>
@@ -1708,7 +2464,17 @@ export default function ChatbotUI() {
                         e.stopPropagation();
                         setOpenMenuId(conv.id);
                       }}
-                      className="p-1 text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent rounded cursor-pointer"
+                      disabled={isAwaitingResponse}
+                      className={`p-1 rounded ${
+                        isAwaitingResponse
+                          ? "text-sidebar-foreground/50 cursor-not-allowed"
+                          : "text-sidebar-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent cursor-pointer"
+                      }`}
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : "More options"
+                      }
                     >
                       <MoreVertical className="w-4 h-4" />
                     </button>
@@ -1716,18 +2482,43 @@ export default function ChatbotUI() {
                     {openMenuId === conv.id && (
                       <div className="absolute right-0 mt-1 w-32 bg-gray-900 border border-sidebar-border rounded shadow-lg z-20">
                         <button
-                          className="w-full text-left px-4 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-primary flex items-center gap-2 cursor-pointer"
-                          onClick={() => startInlineRename(conv.id, conv.title)}
+                          className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 ${
+                            isAwaitingResponse
+                              ? "text-sidebar-foreground/50 cursor-not-allowed"
+                              : "text-sidebar-foreground hover:bg-sidebar-primary cursor-pointer"
+                          }`}
+                          onClick={() =>
+                            !isAwaitingResponse &&
+                            startInlineRename(conv.id, conv.title)
+                          }
+                          disabled={isAwaitingResponse}
+                          title={
+                            isAwaitingResponse
+                              ? "Please wait for current operation to complete"
+                              : "Rename conversation"
+                          }
                         >
                           <Edit className="w-4 h-4" />
                           Rename
                         </button>
                         <button
-                          className="w-full text-left px-4 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-primary flex items-center gap-2 cursor-pointer"
+                          className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 ${
+                            isAwaitingResponse
+                              ? "text-sidebar-foreground/50 cursor-not-allowed"
+                              : "text-sidebar-foreground hover:bg-sidebar-primary cursor-pointer"
+                          }`}
                           onClick={() => {
-                            setOpenMenuId(null);
-                            setDeletingId(conv.id);
+                            if (!isAwaitingResponse) {
+                              setOpenMenuId(null);
+                              setDeletingId(conv.id);
+                            }
                           }}
+                          disabled={isAwaitingResponse}
+                          title={
+                            isAwaitingResponse
+                              ? "Please wait for current operation to complete"
+                              : "Delete conversation"
+                          }
                         >
                           Delete
                         </button>
@@ -1744,7 +2535,15 @@ export default function ChatbotUI() {
               <div>
                 <button
                   onClick={handleUserMenuToggle}
-                  className="flex items-center justify-between gap-2 w-full focus:outline-none"
+                  disabled={isAwaitingResponse}
+                  className={`flex items-center justify-between gap-2 w-full focus:outline-none ${
+                    isAwaitingResponse ? "cursor-not-allowed opacity-50" : ""
+                  }`}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "User menu"
+                  }
                 >
                   <div className="w-12 h-8 bg-black rounded-full flex items-center justify-center">
                     <UserIcon className="w-4 h-4 text-sidebar-foreground" />
@@ -1763,13 +2562,33 @@ export default function ChatbotUI() {
                   <div className="absolute bottom-full inset-x-0 ml-2 mb-2 w-9/10 bg-black border border-sidebar-border rounded shadow-lg z-50">
                     <button
                       onClick={openProfileModal}
-                      className="w-full text-left px-4 py-2 text-sm text-sidebar-foreground hover:bg-sidebar-primary cursor-pointer"
+                      disabled={isAwaitingResponse}
+                      className={`w-full text-left px-4 py-2 text-sm ${
+                        isAwaitingResponse
+                          ? "text-sidebar-foreground/50 cursor-not-allowed"
+                          : "text-sidebar-foreground hover:bg-sidebar-primary cursor-pointer"
+                      }`}
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : "Manage your profile"
+                      }
                     >
                       Manage profile
                     </button>
                     <button
                       onClick={handleLogout}
-                      className="w-full text-left px-4 py-2 text-sm text-destructive hover:bg-sidebar-primary cursor-pointer"
+                      disabled={isAwaitingResponse}
+                      className={`w-full text-left px-4 py-2 text-sm ${
+                        isAwaitingResponse
+                          ? "text-destructive/50 cursor-not-allowed"
+                          : "text-destructive hover:bg-sidebar-primary cursor-pointer"
+                      }`}
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : "Sign out of your account"
+                      }
                     >
                       Log out
                     </button>
@@ -1815,8 +2634,18 @@ export default function ChatbotUI() {
           <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
             {!showLeftSidebar && (
               <button
-                onClick={() => setShowLeftSidebar(true)}
-                className="text-muted-foreground hover:text-foreground hover:bg-accent p-2 rounded"
+                onClick={() => !isAwaitingResponse && setShowLeftSidebar(true)}
+                disabled={isAwaitingResponse}
+                className={`p-2 rounded ${
+                  isAwaitingResponse
+                    ? "text-gray-500 cursor-not-allowed"
+                    : "text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Show left sidebar"
+                }
               >
                 <Menu className="w-4 h-4" />
               </button>
@@ -1832,11 +2661,18 @@ export default function ChatbotUI() {
               <Select
                 value={selectedModel}
                 onValueChange={(value) => {
-                  console.log("DEBUG: Model selection changed to:", value);
-                  setSelectedModel(value);
+                  if (!isAwaitingResponse) {
+                    console.log("DEBUG: Model selection changed to:", value);
+                    setSelectedModel(value);
+                  }
                 }}
+                disabled={isAwaitingResponse}
               >
-                <SelectTrigger className="w-32 sm:w-40 bg-transparent border-none shadow-none focus:ring-0 focus:ring-offset-0">
+                <SelectTrigger
+                  className={`w-32 sm:w-40 bg-transparent border-none shadow-none focus:ring-0 focus:ring-offset-0 ${
+                    isAwaitingResponse ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="bg-black">
@@ -1858,9 +2694,16 @@ export default function ChatbotUI() {
             {/* RAG Method Selection */}
             <Select
               value={selectedRagMethod}
-              onValueChange={setSelectedRagMethod}
+              onValueChange={(value) =>
+                !isAwaitingResponse && setSelectedRagMethod(value)
+              }
+              disabled={isAwaitingResponse}
             >
-              <SelectTrigger className="w-36 sm:w-44 bg-input border-border">
+              <SelectTrigger
+                className={`w-36 sm:w-44 bg-input border-border ${
+                  isAwaitingResponse ? "opacity-50 cursor-not-allowed" : ""
+                }`}
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className="bg-black">
@@ -1885,9 +2728,16 @@ export default function ChatbotUI() {
             {/* Retrieval Method Selection */}
             <Select
               value={selectedRetrievalMethod}
-              onValueChange={setSelectedRetrievalMethod}
+              onValueChange={(value) =>
+                !isAwaitingResponse && setSelectedRetrievalMethod(value)
+              }
+              disabled={isAwaitingResponse}
             >
-              <SelectTrigger className="w-32 sm:w-40 bg-input border-border">
+              <SelectTrigger
+                className={`w-32 sm:w-40 bg-input border-border ${
+                  isAwaitingResponse ? "opacity-50 cursor-not-allowed" : ""
+                }`}
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className="bg-black">
@@ -1905,8 +2755,18 @@ export default function ChatbotUI() {
 
           {!showRightSidebar && (
             <button
-              onClick={() => setShowRightSidebar(true)}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent p-2 rounded flex items-center gap-2"
+              onClick={() => !isAwaitingResponse && setShowRightSidebar(true)}
+              disabled={isAwaitingResponse}
+              className={`p-2 rounded flex items-center gap-2 ${
+                isAwaitingResponse
+                  ? "text-gray-500 cursor-not-allowed"
+                  : "text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer"
+              }`}
+              title={
+                isAwaitingResponse
+                  ? "Please wait for current operation to complete"
+                  : "Show right sidebar"
+              }
             >
               <Settings className="w-4 h-4" />
             </button>
@@ -1923,32 +2783,65 @@ export default function ChatbotUI() {
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 mb-6 sm:mb-8 max-w-6xl mx-auto px-4 w-full">
                 <button
-                  className="border border-border text-muted-foreground hover:bg-accent px-3 sm:px-4 py-2 rounded cursor-pointer text-left text-sm sm:text-base"
+                  className={`border border-border px-3 sm:px-4 py-2 rounded text-left text-sm sm:text-base ${
+                    isAwaitingResponse
+                      ? "text-gray-500 cursor-not-allowed"
+                      : "text-muted-foreground hover:bg-accent cursor-pointer"
+                  }`}
                   onClick={() =>
+                    !isAwaitingResponse &&
                     handleExampleClick(
                       "What is your name and who developed you?"
                     )
+                  }
+                  disabled={isAwaitingResponse}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Ask about the AI's identity"
                   }
                 >
                   What is your name and who developed you?
                 </button>
                 <button
-                  className="border border-border text-muted-foreground hover:bg-accent px-3 sm:px-4 py-2 rounded cursor-pointer text-left text-sm sm:text-base"
+                  className={`border border-border px-3 sm:px-4 py-2 rounded text-left text-sm sm:text-base ${
+                    isAwaitingResponse
+                      ? "text-gray-500 cursor-not-allowed"
+                      : "text-muted-foreground hover:bg-accent cursor-pointer"
+                  }`}
                   onClick={() =>
+                    !isAwaitingResponse &&
                     handleExampleClick(
                       "Why is bending your knees before lifting safer than keeping your legs straight?"
                     )
+                  }
+                  disabled={isAwaitingResponse}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Ask about lifting safety"
                   }
                 >
                   Why is bending your knees before lifting safer than keeping
                   your legs straight?
                 </button>
                 <button
-                  className="border border-border text-muted-foreground hover:bg-accent px-3 sm:px-4 py-2 rounded cursor-pointer text-left text-sm sm:text-base"
+                  className={`border border-border px-3 sm:px-4 py-2 rounded text-left text-sm sm:text-base ${
+                    isAwaitingResponse
+                      ? "text-gray-500 cursor-not-allowed"
+                      : "text-muted-foreground hover:bg-accent cursor-pointer"
+                  }`}
                   onClick={() =>
+                    !isAwaitingResponse &&
                     handleExampleClick(
                       "Explain why slipping on a wet surface leads to a fall—what forces and frictional changes are at play?"
                     )
+                  }
+                  disabled={isAwaitingResponse}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Ask about physics of slipping"
                   }
                 >
                   Explain why slipping on a wet surface leads to a fall—what
@@ -1959,22 +2852,53 @@ export default function ChatbotUI() {
           ) : (
             <div className="flex-1 overflow-y-auto p-4 sm:p-6 chat-scrollbar">
               <div className="max-w-4xl mx-auto space-y-4 sm:space-y-6">
+                {(() => {
+                  console.log(
+                    "DEBUG: Rendering chat area with currentMessages:",
+                    {
+                      messagesCount: currentMessages.length,
+                      messages: currentMessages.map((m) => ({
+                        id: m.id,
+                        sender: m.sender,
+                        contentLength: m.content?.length || 0,
+                      })),
+                      currentBranchId,
+                      historyIndex: currentIndex,
+                    }
+                  );
+                  return null;
+                })()}
                 {currentMessages.map((message, idx) => {
                   // Debug: Log message details for AI messages
-                  if (message.sender === "ai") {
+                  if (
+                    message.sender === "assistant" ||
+                    message.sender === "ai"
+                  ) {
                     console.log("DEBUG: Rendering AI message:", {
                       id: message.id,
+                      sender: message.sender,
                       content: message.content.substring(0, 50) + "...",
                       thinkingTime: message.thinkingTime,
                       hasThinkingTime: message.thinkingTime != null,
                     });
                   }
 
+                  console.log("DEBUG: Rendering message:", {
+                    idx,
+                    id: message.id,
+                    sender: message.sender,
+                    contentLength: message.content?.length || 0,
+                    contentPreview: message.content?.substring(0, 50) + "...",
+                  });
+
                   return (
                     <div
                       key={message.id}
                       className={`flex gap-3 sm:gap-4 ${
-                        message.sender === "ai" ? "w-full" : ""
+                        message.sender === "assistant" ||
+                        message.sender === "ai"
+                          ? "w-full"
+                          : ""
                       }`}
                     >
                       {message.sender === "user" ? (
@@ -1982,29 +2906,45 @@ export default function ChatbotUI() {
                           {/* User bubble */}
                           <div className="bg-gray-600 text-white p-3 rounded-2xl rounded-br-md whitespace-pre-wrap break-words max-w-full shadow-sm">
                             {editingId === message.id ? (
-                              <div className="space-y-2">
+                              <div className="space-y-2 w-full max-w-[280px] sm:max-w-xs lg:max-w-md">
                                 <textarea
                                   ref={editTextareaRef}
                                   value={editingText}
                                   onChange={(e) =>
                                     setEditingText(e.target.value)
                                   }
-                                  className="bg-input text-foreground p-2 rounded border border-border focus:outline-none focus:ring-2 focus:ring-primary resize-none overflow-hidden"
-                                  style={{ width: "400px" }}
+                                  disabled={isAwaitingResponse}
+                                  className={`w-full p-2 rounded border border-border focus:outline-none focus:ring-2 focus:ring-primary resize-none overflow-hidden ${
+                                    isAwaitingResponse
+                                      ? "bg-gray-500 text-gray-300 cursor-not-allowed"
+                                      : "bg-input text-foreground"
+                                  }`}
                                   rows={1}
                                   autoFocus
                                 />
                                 <div className="flex gap-2">
                                   <button
+                                    type="button"
                                     onClick={() => commitEdit(message.id)}
-                                    className="px-3 py-1 bg-primary hover:bg-primary/90 text-primary-foreground rounded text-sm flex items-center gap-1 cursor-pointer"
+                                    disabled={isAwaitingResponse}
+                                    className={`px-3 py-1 rounded text-sm flex items-center gap-1 transition-all duration-200 active:scale-95 shadow-sm hover:shadow-md ${
+                                      isAwaitingResponse
+                                        ? "bg-gray-500 text-gray-300 cursor-not-allowed"
+                                        : "bg-green-600 hover:bg-green-700 active:bg-green-800 text-white cursor-pointer"
+                                    }`}
                                   >
                                     <Check className="w-3 h-3" />
-                                    Save
+                                    {isAwaitingResponse ? "Saving..." : "Save"}
                                   </button>
                                   <button
+                                    type="button"
                                     onClick={cancelEdit}
-                                    className="px-3 py-1 bg-muted hover:bg-muted-foreground text-foreground rounded text-sm cursor-pointer"
+                                    disabled={isAwaitingResponse}
+                                    className={`px-3 py-1 rounded text-sm transition-colors ${
+                                      isAwaitingResponse
+                                        ? "bg-gray-500 text-gray-300 cursor-not-allowed"
+                                        : "bg-muted hover:bg-muted-foreground active:bg-muted/80 text-foreground cursor-pointer"
+                                    }`}
                                   >
                                     Cancel
                                   </button>
@@ -2024,7 +2964,17 @@ export default function ChatbotUI() {
                                   onClick={() =>
                                     handleCopy(message.id, message.content)
                                   }
-                                  className="hover:text-foreground cursor-pointer"
+                                  disabled={isAwaitingResponse}
+                                  className={`hover:text-foreground cursor-pointer ${
+                                    isAwaitingResponse
+                                      ? "opacity-50 cursor-not-allowed"
+                                      : ""
+                                  }`}
+                                  title={
+                                    isAwaitingResponse
+                                      ? "Please wait for current operation to complete"
+                                      : "Copy message"
+                                  }
                                 >
                                   {justCopiedId === message.id ? (
                                     <Check className="w-4 h-4" />
@@ -2037,8 +2987,29 @@ export default function ChatbotUI() {
                                   onClick={() =>
                                     startEdit(message.id, message.content)
                                   }
+                                  disabled={
+                                    (editingId !== null &&
+                                      editingId !== message.id) ||
+                                    isAwaitingResponse
+                                  }
+                                  title={
+                                    editingId !== null &&
+                                    editingId !== message.id
+                                      ? "Finish editing current message first"
+                                      : isAwaitingResponse
+                                      ? "Please wait for current operation to complete"
+                                      : "Edit message"
+                                  }
                                 >
-                                  <Edit className="w-4 h-4" />
+                                  <Edit
+                                    className={`w-4 h-4 ${
+                                      (editingId !== null &&
+                                        editingId !== message.id) ||
+                                      isAwaitingResponse
+                                        ? "text-muted-foreground opacity-50"
+                                        : ""
+                                    }`}
+                                  />
                                 </button>
 
                                 {/*arrows: show arrows if the user message has multiple branches */}
@@ -2047,13 +3018,20 @@ export default function ChatbotUI() {
                                     <button
                                       onClick={() => goToPrev(message.id)}
                                       disabled={
-                                        getBranchIndex(message.id) === 0
+                                        getBranchIndex(message.id) === 0 ||
+                                        isAwaitingResponse
                                       }
                                       className={`p-1 rounded cursor-pointer ${
-                                        getBranchIndex(message.id) === 0
+                                        getBranchIndex(message.id) === 0 ||
+                                        isAwaitingResponse
                                           ? "text-muted-foreground cursor-not-allowed"
                                           : "text-muted-foreground hover:text-foreground hover:bg-accent"
                                       }`}
+                                      title={
+                                        isAwaitingResponse
+                                          ? "Please wait for current operation to complete"
+                                          : "Go to previous branch"
+                                      }
                                     >
                                       <ArrowLeft className="w-4 h-4" />
                                     </button>
@@ -2067,18 +3045,23 @@ export default function ChatbotUI() {
                                       onClick={() => goToNext(message.id)}
                                       disabled={
                                         getBranchIndex(message.id) + 1 ===
-                                        (history[currentIndex]
-                                          .branchesByEditId?.[message.id]
-                                          ?.length ?? 0)
+                                          (history[currentIndex]
+                                            .branchesByEditId?.[message.id]
+                                            ?.length ?? 0) || isAwaitingResponse
                                       }
                                       className={`p-1 rounded cursor-pointer ${
                                         getBranchIndex(message.id) + 1 ===
-                                        (history[currentIndex]
-                                          .branchesByEditId?.[message.id]
-                                          ?.length ?? 0)
+                                          (history[currentIndex]
+                                            .branchesByEditId?.[message.id]
+                                            ?.length ?? 0) || isAwaitingResponse
                                           ? "text-muted-foreground cursor-not-allowed"
                                           : "text-muted-foreground hover:text-foreground hover:bg-accent"
                                       }`}
+                                      title={
+                                        isAwaitingResponse
+                                          ? "Please wait for current operation to complete"
+                                          : "Go to next branch"
+                                      }
                                     >
                                       <ArrowRight className="w-4 h-4" />
                                     </button>
@@ -2090,11 +3073,12 @@ export default function ChatbotUI() {
                         </div>
                       ) : (
                         // AI message - full width like modern chatbots
-                        message.sender === "ai" && (
-                          <div className="w-full max-w-none">
+                        (message.sender === "assistant" ||
+                          message.sender === "ai") && (
+                          <div className="w-full max-w-none px-4">
                             {message.isThinking ? (
                               // Show only thinking indicator during regeneration
-                              <div className="text-white py-3 w-full">
+                              <div className="text-white py-3 w-full px-0">
                                 <div className="flex items-center gap-2">
                                   <div className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"></div>
                                   <div
@@ -2105,7 +3089,7 @@ export default function ChatbotUI() {
                                     className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"
                                     style={{ animationDelay: "0.4s" }}
                                   ></div>
-                                  <span className="text-gray-600 text-sm ml-2">
+                                  <span className="text-gray-400 text-sm ml-2">
                                     Thinking...
                                   </span>
                                 </div>
@@ -2134,47 +3118,59 @@ export default function ChatbotUI() {
                                           onClick={() =>
                                             toggleThoughts(message.id)
                                           }
-                                          className="text-gray-600 mt-2 mr-1 mb-2 text-xs hover:underline cursor-pointer"
+                                          className="text-gray-400 hover:text-gray-300 mt-2 mr-1 mb-2 text-xs hover:underline cursor-pointer transition-colors"
                                         >
                                           {showThoughts[message.id]
                                             ? "Hide reasoning"
                                             : "Show reasoning"}
                                         </button>
                                       )}
-                                      {/* collapsible reasoning box */}
+                                      {/* collapsible reasoning section */}
                                       {thoughtHtml &&
                                         showThoughts[message.id] && (
-                                          <div className="bg-blue-50/80 text-gray-800 p-3 rounded-lg mt-1 mb-2 whitespace-pre-wrap border border-blue-200/50">
-                                            <div
-                                              dangerouslySetInnerHTML={{
-                                                __html: thoughtHtml,
-                                              }}
-                                            />
+                                          <div className="text-gray-300 py-2 px-0 whitespace-pre-wrap border-l-2 border-gray-600 pl-4 mb-3">
+                                            <div className="text-sm opacity-90">
+                                              <div
+                                                dangerouslySetInnerHTML={{
+                                                  __html: thoughtHtml,
+                                                }}
+                                              />
+                                            </div>
                                           </div>
                                         )}
                                       {/* final answer */}
                                       <FormattedContent
                                         html={mainHtml}
-                                        className="text-white py-2 p-4 w-full custom-list max-w-full leading-relaxed"
+                                        className="text-white py-2 px-0 w-full custom-list max-w-full leading-relaxed"
                                       />
                                     </div>
                                   );
                                 })()}
                                 {/* Thinking time */}
                                 {message.thinkingTime != null && (
-                                  <div className="text-muted-foreground text-sm mt-2 pl-4">
+                                  <div className="text-muted-foreground text-sm mt-2">
                                     Thought for{" "}
                                     {(message.thinkingTime / 1000).toFixed(2)}s
                                   </div>
                                 )}
 
                                 {/* Buttons */}
-                                <div className="flex gap-2.5 pt-3 pl-4 text-xs text-muted-foreground">
+                                <div className="flex gap-2.5 pt-3 text-xs text-muted-foreground">
                                   <button
                                     onClick={() =>
                                       handleFeedback(message.id, 0)
                                     }
-                                    className="hover:text-foreground cursor-pointer"
+                                    disabled={isAwaitingResponse}
+                                    className={`hover:text-foreground cursor-pointer ${
+                                      isAwaitingResponse
+                                        ? "opacity-50 cursor-not-allowed"
+                                        : ""
+                                    }`}
+                                    title={
+                                      isAwaitingResponse
+                                        ? "Please wait for current operation to complete"
+                                        : "Thumbs up"
+                                    }
                                   >
                                     <ThumbsUp
                                       className={`w-4 h-4 ${
@@ -2188,7 +3184,17 @@ export default function ChatbotUI() {
                                     onClick={() =>
                                       handleFeedback(message.id, 1)
                                     }
-                                    className="hover:text-foreground cursor-pointer"
+                                    disabled={isAwaitingResponse}
+                                    className={`hover:text-foreground cursor-pointer ${
+                                      isAwaitingResponse
+                                        ? "opacity-50 cursor-not-allowed"
+                                        : ""
+                                    }`}
+                                    title={
+                                      isAwaitingResponse
+                                        ? "Please wait for current operation to complete"
+                                        : "Thumbs down"
+                                    }
                                   >
                                     <ThumbsDown
                                       className={`w-4 h-4 ${
@@ -2203,6 +3209,8 @@ export default function ChatbotUI() {
                                     title={
                                       message.isThinking
                                         ? "Regenerating..."
+                                        : isAwaitingResponse
+                                        ? "Please wait for current operation to complete"
                                         : "Regenerate response"
                                     }
                                     className={`hover:text-foreground cursor-pointer transition-colors ${
@@ -2211,7 +3219,9 @@ export default function ChatbotUI() {
                                         : ""
                                     }`}
                                     disabled={
-                                      isRegenerating || message.isThinking
+                                      isRegenerating ||
+                                      message.isThinking ||
+                                      isAwaitingResponse
                                     }
                                   >
                                     <RefreshCw className="w-4 h-4" />
@@ -2220,7 +3230,17 @@ export default function ChatbotUI() {
                                     onClick={() =>
                                       handleCopy(message.id, message.content)
                                     }
-                                    className="hover:text-foreground cursor-pointer"
+                                    disabled={isAwaitingResponse}
+                                    className={`hover:text-foreground cursor-pointer ${
+                                      isAwaitingResponse
+                                        ? "opacity-50 cursor-not-allowed"
+                                        : ""
+                                    }`}
+                                    title={
+                                      isAwaitingResponse
+                                        ? "Please wait for current operation to complete"
+                                        : "Copy message"
+                                    }
                                   >
                                     {justCopiedId === message.id ? (
                                       <Check className="w-4 h-4" />
@@ -2252,7 +3272,7 @@ export default function ChatbotUI() {
                             className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"
                             style={{ animationDelay: "0.4s" }}
                           ></div>
-                          <span className="text-gray-600 text-sm ml-2">
+                          <span className="text-gray-400 text-sm ml-2">
                             Thinking...
                           </span>
                         </div>
@@ -2296,7 +3316,17 @@ export default function ChatbotUI() {
                         <span>{feature}</span>
                         <button
                           onClick={() => clearFeature(feature)}
-                          className="hover:bg-primary/80 rounded-full p-0.5 transition-colors"
+                          disabled={isAwaitingResponse}
+                          className={`rounded-full p-0.5 transition-colors ${
+                            isAwaitingResponse
+                              ? "opacity-50 cursor-not-allowed"
+                              : "hover:bg-primary/80"
+                          }`}
+                          title={
+                            isAwaitingResponse
+                              ? "Please wait for current operation to complete"
+                              : `Remove ${feature}`
+                          }
                         >
                           <X className="w-3 h-3" />
                         </button>
@@ -2304,7 +3334,17 @@ export default function ChatbotUI() {
                     ))}
                     <button
                       onClick={clearAllFeatures}
-                      className="text-muted-foreground hover:text-foreground text-sm underline transition-colors"
+                      disabled={isAwaitingResponse}
+                      className={`text-sm underline transition-colors ${
+                        isAwaitingResponse
+                          ? "text-gray-500 cursor-not-allowed"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : "Clear all features"
+                      }
                     >
                       Clear all
                     </button>
@@ -2337,9 +3377,18 @@ export default function ChatbotUI() {
                         handleSendMessage();
                       }
                     }}
-                    placeholder="Ask Comfit Copilot..."
+                    placeholder={
+                      isAwaitingResponse
+                        ? "Please wait..."
+                        : "Ask Comfit Copilot..."
+                    }
                     rows={1}
-                    className="w-full bg-transparent text-foreground px-4 pt-3 pb-2 resize-none border-none outline-none"
+                    disabled={isAwaitingResponse}
+                    className={`w-full bg-transparent px-4 pt-3 pb-2 resize-none border-none outline-none ${
+                      isAwaitingResponse
+                        ? "text-gray-400 cursor-not-allowed"
+                        : "text-foreground"
+                    }`}
                     style={{
                       lineHeight: "1.5",
                       minHeight: "44px",
@@ -2359,7 +3408,17 @@ export default function ChatbotUI() {
                           e.stopPropagation();
                           togglePlusDropdown();
                         }}
-                        className="flex items-center justify-center w-8 h-8 cursor-pointer hover:bg-accent rounded transition-colors duration-150"
+                        disabled={isAwaitingResponse}
+                        className={`flex items-center justify-center w-8 h-8 rounded transition-colors duration-150 ${
+                          isAwaitingResponse
+                            ? "cursor-not-allowed opacity-50"
+                            : "cursor-pointer hover:bg-accent"
+                        }`}
+                        title={
+                          isAwaitingResponse
+                            ? "Please wait for current operation to complete"
+                            : "More options"
+                        }
                       >
                         <Plus className="w-5 h-5 text-muted-foreground" />
                       </button>
@@ -2378,9 +3437,12 @@ export default function ChatbotUI() {
                               <div className="flex gap-1">
                                 <button
                                   onClick={() => setEngineType("chat")}
+                                  disabled={isAwaitingResponse}
                                   className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
                                     engineType === "chat"
                                       ? "bg-blue-600 text-white"
+                                      : isAwaitingResponse
+                                      ? "text-gray-500 cursor-not-allowed"
                                       : "text-gray-300 hover:text-white hover:bg-gray-700"
                                   }`}
                                 >
@@ -2389,9 +3451,12 @@ export default function ChatbotUI() {
                                 </button>
                                 <button
                                   onClick={() => setEngineType("query")}
+                                  disabled={isAwaitingResponse}
                                   className={`flex items-center gap-1 px-2 py-1 rounded text-xs font-medium transition-colors ${
                                     engineType === "query"
                                       ? "bg-blue-600 text-white"
+                                      : isAwaitingResponse
+                                      ? "text-gray-500 cursor-not-allowed"
                                       : "text-gray-300 hover:text-white hover:bg-gray-700"
                                   }`}
                                 >
@@ -2410,7 +3475,17 @@ export default function ChatbotUI() {
                             <div className="relative">
                               <button
                                 onClick={() => toggleSubmenu("vector-store")}
-                                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
+                                disabled={isAwaitingResponse}
+                                className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded transition-colors ${
+                                  isAwaitingResponse
+                                    ? "text-muted-foreground cursor-not-allowed opacity-50"
+                                    : "text-foreground hover:bg-accent cursor-pointer"
+                                }`}
+                                title={
+                                  isAwaitingResponse
+                                    ? "Please wait for current operation to complete"
+                                    : "Vector Store options"
+                                }
                               >
                                 <VectorSquare className="w-4 h-4" />
                                 <span>Vector Store</span>
@@ -2427,7 +3502,17 @@ export default function ChatbotUI() {
                                       <button
                                         key={option}
                                         onClick={() => selectFeature(option)}
-                                        className="w-full flex items-center justify-between px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
+                                        disabled={isAwaitingResponse}
+                                        className={`w-full flex items-center justify-between px-3 py-2 text-sm rounded transition-colors ${
+                                          isAwaitingResponse
+                                            ? "text-muted-foreground cursor-not-allowed opacity-50"
+                                            : "text-foreground hover:bg-accent cursor-pointer"
+                                        }`}
+                                        title={
+                                          isAwaitingResponse
+                                            ? "Please wait for current operation to complete"
+                                            : `Select ${option.split(" - ")[1]}`
+                                        }
                                       >
                                         <span>{option.split(" - ")[1]}</span>
                                         {activeFeatures.includes(option) && (
@@ -2443,7 +3528,11 @@ export default function ChatbotUI() {
                             {/* Add Files */}
                             <label
                               htmlFor="file-upload"
-                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-accent rounded transition-colors cursor-pointer"
+                              className={`w-full flex items-center gap-2 px-3 py-2 text-sm rounded transition-colors ${
+                                uploading || isAwaitingResponse
+                                  ? "text-muted-foreground cursor-not-allowed opacity-50"
+                                  : "text-foreground hover:bg-accent cursor-pointer"
+                              }`}
                             >
                               <Paperclip className="w-4 h-4" />
                               <span>Add Files</span>
@@ -2452,7 +3541,7 @@ export default function ChatbotUI() {
                                 type="file"
                                 accept=".pdf,.txt"
                                 onChange={handleFileChange}
-                                disabled={uploading}
+                                disabled={uploading || isAwaitingResponse}
                                 className="sr-only"
                               />
                             </label>
@@ -2464,7 +3553,19 @@ export default function ChatbotUI() {
 
                   {/* Voice Mode Icon and send/cancel button */}
                   <div className="flex items-center gap-2 pointer-events-auto">
-                    <button className="flex items-center justify-center w-8 h-8 cursor-pointer hover:bg-accent rounded transition-colors duration-150">
+                    <button
+                      className={`flex items-center justify-center w-8 h-8 rounded transition-colors duration-150 ${
+                        isAwaitingResponse
+                          ? "cursor-not-allowed opacity-50"
+                          : "cursor-pointer hover:bg-accent"
+                      }`}
+                      disabled={isAwaitingResponse}
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : "Voice input"
+                      }
+                    >
                       <Mic className="w-5 h-5 text-muted-foreground" />
                     </button>
 
@@ -2474,7 +3575,8 @@ export default function ChatbotUI() {
                       }
                       disabled={
                         limitReached ||
-                        (!isAwaitingResponse && !inputValue.trim())
+                        (!isAwaitingResponse && !inputValue.trim()) ||
+                        isAwaitingResponse
                       }
                       title={
                         isAwaitingResponse
@@ -2514,8 +3616,20 @@ export default function ChatbotUI() {
                 Advanced Settings
               </span>
               <button
-                onClick={() => setShowRightSidebar(false)}
-                className="p-1 hover:bg-sidebar-accent rounded cursor-pointer transition-colors"
+                onClick={() =>
+                  !isAwaitingResponse && setShowRightSidebar(false)
+                }
+                disabled={isAwaitingResponse}
+                className={`p-1 rounded transition-colors ${
+                  isAwaitingResponse
+                    ? "cursor-not-allowed opacity-50"
+                    : "hover:bg-sidebar-accent cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Hide right sidebar"
+                }
               >
                 <X className="w-4 h-4 cursor-pointer text-sidebar-primary-foreground" />
               </button>
@@ -2526,8 +3640,20 @@ export default function ChatbotUI() {
               {/* Presets */}
               <div className="border-b border-sidebar-border">
                 <button
-                  onClick={() => toggleAccordion("presets")}
-                  className="w-full text-left text-sm font-medium text-sidebar-primary-foreground hover:text-sidebar-accent-foreground py-3 flex items-center justify-between cursor-pointer transition-colors"
+                  onClick={() =>
+                    !isAwaitingResponse && toggleAccordion("presets")
+                  }
+                  disabled={isAwaitingResponse}
+                  className={`w-full text-left text-sm font-medium py-3 flex items-center justify-between transition-colors ${
+                    isAwaitingResponse
+                      ? "text-sidebar-primary-foreground/50 cursor-not-allowed"
+                      : "text-sidebar-primary-foreground hover:text-sidebar-accent-foreground cursor-pointer"
+                  }`}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Toggle Vector Store settings"
+                  }
                 >
                   Vector Store
                   <ChevronDown
@@ -2540,10 +3666,19 @@ export default function ChatbotUI() {
                   <div className="pb-4">
                     <Select
                       value={preset}
-                      onValueChange={setPreset}
+                      onValueChange={(value) =>
+                        !isAwaitingResponse && setPreset(value)
+                      }
                       defaultValue="CFIR"
+                      disabled={isAwaitingResponse}
                     >
-                      <SelectTrigger className="bg-black-700 border-black">
+                      <SelectTrigger
+                        className={`bg-black-700 border-black ${
+                          isAwaitingResponse
+                            ? "opacity-50 cursor-not-allowed"
+                            : ""
+                        }`}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent className="bg-black border border-gray-700">
@@ -2587,8 +3722,20 @@ export default function ChatbotUI() {
               {/* Sampling */}
               <div className="border-b border-sidebar-border">
                 <button
-                  onClick={() => toggleAccordion("sampling")}
-                  className="w-full text-left text-sm font-medium text-sidebar-primary-foreground hover:text-sidebar-accent-foreground py-3 flex items-center justify-between cursor-pointer transition-colors"
+                  onClick={() =>
+                    !isAwaitingResponse && toggleAccordion("sampling")
+                  }
+                  disabled={isAwaitingResponse}
+                  className={`w-full text-left text-sm font-medium py-3 flex items-center justify-between transition-colors ${
+                    isAwaitingResponse
+                      ? "text-sidebar-primary-foreground/50 cursor-not-allowed"
+                      : "text-sidebar-primary-foreground hover:text-sidebar-accent-foreground cursor-pointer"
+                  }`}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Toggle Sampling settings"
+                  }
                 >
                   Sampling
                   <ChevronDown
@@ -2608,12 +3755,23 @@ export default function ChatbotUI() {
                           type="number"
                           value={temperature}
                           onChange={(e) =>
+                            !isAwaitingResponse &&
                             setTemperature(Number(e.target.value))
                           }
                           step="0.1"
                           min="0"
                           max="2"
-                          className="w-full bg-black-700 border border-sidebar-border px-3 py-2 rounded text-sidebar-primary-foreground"
+                          disabled={isAwaitingResponse}
+                          className={`w-full border px-3 py-2 rounded ${
+                            isAwaitingResponse
+                              ? "bg-gray-500 border-gray-600 text-gray-400 cursor-not-allowed"
+                              : "bg-black-700 border-sidebar-border text-sidebar-primary-foreground"
+                          }`}
+                          title={
+                            isAwaitingResponse
+                              ? "Please wait for current operation to complete"
+                              : "Adjust temperature (0.0 - 2.0)"
+                          }
                         />
                       </div>
                       <div>
@@ -2623,11 +3781,24 @@ export default function ChatbotUI() {
                         <input
                           type="number"
                           value={topP}
-                          onChange={(e) => setTopP(Number(e.target.value))}
+                          onChange={(e) =>
+                            !isAwaitingResponse &&
+                            setTopP(Number(e.target.value))
+                          }
                           step="0.1"
                           min="0"
                           max="1"
-                          className="w-full bg-black-700 border border-sidebar-border px-3 py-2 rounded text-sidebar-primary-foreground"
+                          disabled={isAwaitingResponse}
+                          className={`w-full border px-3 py-2 rounded ${
+                            isAwaitingResponse
+                              ? "bg-gray-500 border-gray-600 text-gray-400 cursor-not-allowed"
+                              : "bg-black-700 border-sidebar-border text-sidebar-primary-foreground"
+                          }`}
+                          title={
+                            isAwaitingResponse
+                              ? "Please wait for current operation to complete"
+                              : "Adjust top-p (0.0 - 1.0)"
+                          }
                         />
                       </div>
                     </div>
@@ -2638,8 +3809,20 @@ export default function ChatbotUI() {
               {/* Strategies */}
               <div className="border-b border-sidebar-border">
                 <button
-                  onClick={() => toggleAccordion("strategies")}
-                  className="w-full text-left text-sm font-medium text-sidebar-primary-foreground hover:text-sidebar-accent-foreground py-3 flex items-center justify-between cursor-pointer transition-colors"
+                  onClick={() =>
+                    !isAwaitingResponse && toggleAccordion("strategies")
+                  }
+                  disabled={isAwaitingResponse}
+                  className={`w-full text-left text-sm font-medium py-3 flex items-center justify-between transition-colors ${
+                    isAwaitingResponse
+                      ? "text-sidebar-primary-foreground/50 cursor-not-allowed"
+                      : "text-sidebar-primary-foreground hover:text-sidebar-accent-foreground cursor-pointer"
+                  }`}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Toggle Strategies settings"
+                  }
                 >
                   Strategies
                   <ChevronDown
@@ -2652,10 +3835,19 @@ export default function ChatbotUI() {
                   <div className="pb-4">
                     <Select
                       value={strategy}
-                      onValueChange={setStrategy}
+                      onValueChange={(value) =>
+                        !isAwaitingResponse && setStrategy(value)
+                      }
                       defaultValue="no-workflow"
+                      disabled={isAwaitingResponse}
                     >
-                      <SelectTrigger className="bg-black-700 border-black text-sidebar-primary-foreground">
+                      <SelectTrigger
+                        className={`bg-black-700 border-black text-sidebar-primary-foreground ${
+                          isAwaitingResponse
+                            ? "opacity-50 cursor-not-allowed"
+                            : ""
+                        }`}
+                      >
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent className="bg-black border border-gray-700">
@@ -2678,8 +3870,20 @@ export default function ChatbotUI() {
               {/* Mechanistic Interpretability */}
               <div className="border-b border-sidebar-border">
                 <button
-                  onClick={() => toggleAccordion("interpretability")}
-                  className="w-full text-left text-sm font-medium text-sidebar-primary-foreground hover:text-sidebar-accent-foreground py-3 flex items-center justify-between cursor-pointer transition-colors"
+                  onClick={() =>
+                    !isAwaitingResponse && toggleAccordion("interpretability")
+                  }
+                  disabled={isAwaitingResponse}
+                  className={`w-full text-left text-sm font-medium py-3 flex items-center justify-between transition-colors ${
+                    isAwaitingResponse
+                      ? "text-sidebar-primary-foreground/50 cursor-not-allowed"
+                      : "text-sidebar-primary-foreground hover:text-sidebar-accent-foreground cursor-pointer"
+                  }`}
+                  title={
+                    isAwaitingResponse
+                      ? "Please wait for current operation to complete"
+                      : "Toggle Mechanistic Interpretability settings"
+                  }
                 >
                   <div className="flex items-center gap-2">
                     Mechanistic Interpretability
@@ -2701,15 +3905,24 @@ export default function ChatbotUI() {
                         </label>
                         <button
                           onClick={() =>
+                            !isAwaitingResponse &&
                             setMechanisticInterpretability(
                               !mechanisticInterpretability
                             )
                           }
+                          disabled={isAwaitingResponse}
                           className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                             mechanisticInterpretability
                               ? "bg-primary"
+                              : isAwaitingResponse
+                              ? "bg-gray-500"
                               : "bg-sidebar-border"
                           }`}
+                          title={
+                            isAwaitingResponse
+                              ? "Please wait for current operation to complete"
+                              : "Toggle mechanistic interpretability"
+                          }
                         >
                           <span
                             className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -2726,8 +3939,17 @@ export default function ChatbotUI() {
                             <label className="text-sm text-sidebar-primary-foreground block mb-2">
                               Interpretability Level
                             </label>
-                            <Select defaultValue="basic">
-                              <SelectTrigger className="bg-black-700 border-black text-sidebar-primary-foreground">
+                            <Select
+                              defaultValue="basic"
+                              disabled={isAwaitingResponse}
+                            >
+                              <SelectTrigger
+                                className={`bg-black-700 border-black text-sidebar-primary-foreground ${
+                                  isAwaitingResponse
+                                    ? "opacity-50 cursor-not-allowed"
+                                    : ""
+                                }`}
+                              >
                                 <SelectValue />
                               </SelectTrigger>
                               <SelectContent className="bg-black border border-gray-700">
@@ -2768,13 +3990,33 @@ export default function ChatbotUI() {
             <div className="mt-4 flex justify-end space-x-2">
               <button
                 onClick={() => router.push("/auth/signup")}
-                className="px-4 py-2 bg-primary hover:bg-primary/90 rounded cursor-pointer"
+                disabled={isAwaitingResponse}
+                className={`px-4 py-2 rounded ${
+                  isAwaitingResponse
+                    ? "bg-gray-500 cursor-not-allowed"
+                    : "bg-primary hover:bg-primary/90 cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Sign up for more messages"
+                }
               >
                 Sign up
               </button>
               <button
                 onClick={() => setShowLimitModal(false)}
-                className="px-4 py-2 border border-border rounded hover:bg-accent cursor-pointer"
+                disabled={isAwaitingResponse}
+                className={`px-4 py-2 border border-border rounded ${
+                  isAwaitingResponse
+                    ? "cursor-not-allowed"
+                    : "hover:bg-accent cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Close this dialog"
+                }
               >
                 Later
               </button>
@@ -2801,13 +4043,33 @@ export default function ChatbotUI() {
             <div className="px-6 py-4 flex justify-end gap-2 border-t border-gray-700">
               <button
                 onClick={() => setDeletingId(null)}
-                className="px-4 py-1 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 rounded cursor-pointer"
+                disabled={isAwaitingResponse}
+                className={`px-4 py-1 text-sm font-medium rounded ${
+                  isAwaitingResponse
+                    ? "text-gray-500 cursor-not-allowed"
+                    : "text-gray-300 hover:text-white hover:bg-gray-700 cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Cancel deletion"
+                }
               >
                 Cancel
               </button>
               <button
-                onClick={() => deleteChat(deletingId)}
-                className="px-4 py-1 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
+                onClick={() => !isAwaitingResponse && deleteChat(deletingId)}
+                disabled={isAwaitingResponse}
+                className={`px-4 py-1 text-sm font-medium rounded ${
+                  isAwaitingResponse
+                    ? "text-gray-500 cursor-not-allowed"
+                    : "text-white bg-red-600 hover:bg-red-700 cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Confirm deletion"
+                }
               >
                 Delete
               </button>
@@ -2826,10 +4088,22 @@ export default function ChatbotUI() {
               </h3>
               <button
                 onClick={() => {
-                  setShowSearchModal(false);
-                  setSearchQuery("");
+                  if (!isAwaitingResponse) {
+                    setShowSearchModal(false);
+                    setSearchQuery("");
+                  }
                 }}
-                className="text-muted-foreground hover:text-foreground hover:bg-accent p-1 rounded cursor-pointer"
+                disabled={isAwaitingResponse}
+                className={`p-1 rounded ${
+                  isAwaitingResponse
+                    ? "text-gray-500 cursor-not-allowed"
+                    : "text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer"
+                }`}
+                title={
+                  isAwaitingResponse
+                    ? "Please wait for current operation to complete"
+                    : "Close search"
+                }
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2839,8 +4113,15 @@ export default function ChatbotUI() {
               autoFocus
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Type to search..."
-              className="w-full bg-input border border-border text-foreground px-3 py-2 rounded mb-4 focus:outline-none focus:ring-2 focus:ring-primary"
+              placeholder={
+                isAwaitingResponse ? "Please wait..." : "Type to search..."
+              }
+              disabled={isAwaitingResponse}
+              className={`w-full bg-input border border-border px-3 py-2 rounded mb-4 focus:outline-none focus:ring-2 focus:ring-primary ${
+                isAwaitingResponse
+                  ? "text-gray-400 cursor-not-allowed"
+                  : "text-foreground"
+              }`}
             />
             <div className="max-h-60 overflow-y-auto">
               {filteredResults.length === 0 ? (
@@ -2853,9 +4134,19 @@ export default function ChatbotUI() {
                   return (
                     <div
                       key={conv.id}
-                      onClick={() => handleSearchResultClick(idx)}
-                      className="cursor-pointer px-3 py-2 rounded hover:bg-accent text-foreground transition-colors truncate"
-                      title={conv.title}
+                      onClick={() =>
+                        !isAwaitingResponse && handleSearchResultClick(idx)
+                      }
+                      className={`px-3 py-2 rounded transition-colors truncate ${
+                        isAwaitingResponse
+                          ? "text-gray-500 cursor-not-allowed"
+                          : "cursor-pointer hover:bg-accent text-foreground"
+                      }`}
+                      title={
+                        isAwaitingResponse
+                          ? "Please wait for current operation to complete"
+                          : conv.title
+                      }
                     >
                       {conv.title}
                     </div>

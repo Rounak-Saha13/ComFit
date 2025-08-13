@@ -98,7 +98,7 @@ def sample_context_memory():
     return {
         "conversation_history": [
             {"sender": "user", "content": "Hello"},
-            {"sender": "ai", "content": "Hi there!"}
+            {"sender": "assistant", "content": "Hi there!"}
         ],
         "system_prompt": "You are a helpful assistant",
         "model_config": {

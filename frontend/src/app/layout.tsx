@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import { ThemeProvider } from "next-themes";
 import RouteLoader from "@/components/ui/RouteLoader";
 import "./globals.css";
 
@@ -29,14 +28,8 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="dark"
-          enableSystem={false}
-        >
-          <RouteLoader />
-          {children}
-        </ThemeProvider>
+        <RouteLoader />
+        {children}
       </body>
     </html>
   );
