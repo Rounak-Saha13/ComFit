@@ -296,7 +296,7 @@ async def update_branch(
         # Update branch JSON
         result = (
             supabase.table("branches")
-            .update({"messages": norm_msgs, "updated_at": datetime.utcnow().isoformat()})
+            .update({"messages": norm_msgs})
             .eq("id", branch_id)
             .execute()
         )
