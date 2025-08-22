@@ -298,6 +298,20 @@ export default function ChatbotUI() {
   const [selectedRetrievalMethod, setSelectedRetrievalMethod] =
     useState("local context only");
 
+  // states for vector stores
+  const [availableVectorStores, setAvailableVectorStores] = useState<
+    Array<{
+      id: string;
+      display_name: string;
+      filename: string;
+      path: string;
+    }>
+  >([]);
+  const [loadingVectorStores, setLoadingVectorStores] = useState(false);
+  const [vectorStoresError, setVectorStoresError] = useState<string | null>(
+    null
+  );
+
   // right sidebar controls
   const [systemPrompt, setSystemPrompt] = useState(
     "You are a helpful AI assistant for comfort and fitting clothing"
@@ -596,6 +610,52 @@ export default function ChatbotUI() {
     }
     loadModels();
   }, []);
+
+  // fetch vector stores list
+  useEffect(() => {
+    async function loadVectorStores() {
+      console.log(
+        "DEBUG: Loading vector stores from:",
+        `${API_URL}/api/vector-stores`
+      );
+      setLoadingVectorStores(true);
+      try {
+        const res = await fetch(`${API_URL}/api/vector-stores`);
+        console.log("DEBUG: Vector stores response status:", res.status);
+
+        if (!res.ok) {
+          const errorText = await res.text();
+          console.error("DEBUG: Vector stores error response:", errorText);
+          throw new Error(errorText);
+        }
+
+        const data = await res.json();
+        console.log("DEBUG: Vector stores response data:", data);
+        const { vector_stores, count, directory } = data;
+        console.log("DEBUG: Available vector stores:", vector_stores);
+        console.log("DEBUG: Vector store count:", count);
+        console.log("DEBUG: Directory:", directory);
+        setAvailableVectorStores(vector_stores || []);
+      } catch (err) {
+        console.error("DEBUG: Error loading vector stores:", err);
+        setAvailableVectorStores([]);
+        setVectorStoresError(
+          err instanceof Error ? err.message : "Failed to load vector stores"
+        );
+      } finally {
+        setLoadingVectorStores(false);
+      }
+    }
+    loadVectorStores();
+  }, [user]); // Re-run when user changes
+
+  // Update preset when vector stores are loaded
+  useEffect(() => {
+    if (availableVectorStores.length > 0 && preset === "CFIR") {
+      // Only update if we still have the default value
+      setPreset(availableVectorStores[0].id);
+    }
+  }, [availableVectorStores, preset]);
 
   const handleFeedback = async (messageId: string, value: number) => {
     // check value
@@ -2307,6 +2367,29 @@ export default function ChatbotUI() {
     setActiveFeatures([]);
   };
 
+  // Refresh vector stores
+  const refreshVectorStores = async () => {
+    setLoadingVectorStores(true);
+    setVectorStoresError(null); // Clear previous errors
+    try {
+      const res = await fetch(`${API_URL}/api/vector-stores`);
+
+      if (!res.ok) {
+        throw new Error("Failed to refresh vector stores");
+      }
+
+      const data = await res.json();
+      setAvailableVectorStores(data.vector_stores || []);
+    } catch (err) {
+      console.error("Error refreshing vector stores:", err);
+      setVectorStoresError(
+        err instanceof Error ? err.message : "Failed to refresh vector stores"
+      );
+    } finally {
+      setLoadingVectorStores(false);
+    }
+  };
+
   // loading spinner
   if (loading) {
     return (
@@ -3492,37 +3575,75 @@ export default function ChatbotUI() {
                               >
                                 <VectorSquare className="w-4 h-4" />
                                 <span>Vector Store</span>
+
                                 <ChevronRight className="w-4 h-4 ml-auto" />
                               </button>
                               {openSubmenu === "vector-store" && (
                                 <div className="absolute left-full top-0 ml-2 w-64 bg-black border border-border rounded-lg shadow-lg cursor-pointer">
                                   <div className="p-2">
-                                    {[
-                                      "Vector Store - CFIR",
-                                      "Vector Store - Injury Typology",
-                                      "Vector Store - Anatomical Regions",
-                                    ].map((option) => (
-                                      <button
-                                        key={option}
-                                        onClick={() => selectFeature(option)}
-                                        disabled={isAwaitingResponse}
-                                        className={`w-full flex items-center justify-between px-3 py-2 text-sm rounded transition-colors ${
-                                          isAwaitingResponse
-                                            ? "text-muted-foreground cursor-not-allowed opacity-50"
-                                            : "text-foreground hover:bg-accent cursor-pointer"
-                                        }`}
-                                        title={
-                                          isAwaitingResponse
-                                            ? "Please wait for current operation to complete"
-                                            : `Select ${option.split(" - ")[1]}`
-                                        }
-                                      >
-                                        <span>{option.split(" - ")[1]}</span>
-                                        {activeFeatures.includes(option) && (
-                                          <Check className="w-4 h-4" />
-                                        )}
-                                      </button>
-                                    ))}
+                                    {loadingVectorStores ? (
+                                      <div className="px-3 py-2 text-sm text-muted-foreground flex items-center gap-2">
+                                        <RefreshCw className="w-4 h-4 animate-spin" />
+                                        Loading vector stores...
+                                      </div>
+                                    ) : vectorStoresError ? (
+                                      <div className="px-3 py-2 text-sm text-red-400 text-center">
+                                        <div className="mb-2">
+                                          Error loading vector stores
+                                        </div>
+                                        <div className="text-xs text-red-300">
+                                          {vectorStoresError}
+                                        </div>
+                                      </div>
+                                    ) : availableVectorStores.length === 0 ? (
+                                      <div className="px-3 py-2 text-sm text-muted-foreground text-center">
+                                        <div className="mb-2">
+                                          No vector stores available
+                                        </div>
+                                        <div className="text-xs text-muted-foreground/70">
+                                          Check the vector_store directory for
+                                          DuckDB files
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <>
+                                        {availableVectorStores
+                                          .slice(0, 3)
+                                          .map((store) => {
+                                            const option = `Vector Store - ${store.display_name}`;
+                                            return (
+                                              <button
+                                                key={store.id}
+                                                onClick={() =>
+                                                  selectFeature(option)
+                                                }
+                                                disabled={isAwaitingResponse}
+                                                className={`w-full flex items-center justify-between px-3 py-2 text-sm rounded transition-colors ${
+                                                  isAwaitingResponse
+                                                    ? "text-muted-foreground cursor-not-allowed opacity-50"
+                                                    : "text-foreground hover:bg-accent cursor-pointer"
+                                                }`}
+                                                title={
+                                                  isAwaitingResponse
+                                                    ? "Please wait for current operation to complete"
+                                                    : `Select ${store.display_name}`
+                                                }
+                                              >
+                                                <div className="flex flex-col items-start">
+                                                  <span className="font-medium">
+                                                    {store.display_name}
+                                                  </span>
+                                                </div>
+                                                {activeFeatures.includes(
+                                                  option
+                                                ) && (
+                                                  <Check className="w-4 h-4 text-green-500" />
+                                                )}
+                                              </button>
+                                            );
+                                          })}
+                                      </>
+                                    )}
                                   </div>
                                 </div>
                               )}
@@ -3667,57 +3788,55 @@ export default function ChatbotUI() {
                 </button>
                 {openAccordions.includes("presets") && (
                   <div className="pb-4">
-                    <Select
-                      value={preset}
-                      onValueChange={(value) =>
-                        !isAwaitingResponse && setPreset(value)
-                      }
-                      defaultValue="CFIR"
-                      disabled={isAwaitingResponse}
-                    >
-                      <SelectTrigger
-                        className={`bg-black-700 border-black ${
-                          isAwaitingResponse
-                            ? "opacity-50 cursor-not-allowed"
-                            : ""
-                        }`}
+                    {loadingVectorStores ? (
+                      <div className="text-sm text-sidebar-primary-foreground/70 text-center py-2">
+                        Loading vector stores...
+                      </div>
+                    ) : vectorStoresError ? (
+                      <div className="text-sm text-red-400 text-center py-2">
+                        <div className="mb-2">Error loading vector stores</div>
+                        <div className="text-xs text-red-300">
+                          {vectorStoresError}
+                        </div>
+                        <button
+                          onClick={refreshVectorStores}
+                          disabled={isAwaitingResponse}
+                          className="mt-2 px-3 py-1 text-xs bg-red-600 hover:bg-red-700 rounded transition-colors"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    ) : availableVectorStores.length === 0 ? (
+                      <div className="text-sm text-sidebar-primary-foreground/70 text-center py-2">
+                        No vector stores available
+                      </div>
+                    ) : (
+                      <Select
+                        value={preset}
+                        onValueChange={(value) =>
+                          !isAwaitingResponse && setPreset(value)
+                        }
+                        defaultValue={availableVectorStores[0]?.id || "CFIR"}
+                        disabled={isAwaitingResponse}
                       >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent className="bg-black border border-gray-700">
-                        <SelectItem value="CFIR">CFIR</SelectItem>
-                        <SelectItem value="Head and Neck">
-                          Anatomical Regions - Head and Neck
-                        </SelectItem>
-                        <SelectItem value="Lower Extremity">
-                          Anatomical Regions - Lower Extremity
-                        </SelectItem>
-                        <SelectItem value="Spine">
-                          Anatomical Regions - Spine
-                        </SelectItem>
-                        <SelectItem value="Torso">
-                          Anatomical Regions - Torso
-                        </SelectItem>
-                        <SelectItem value="Upper Extremity">
-                          Anatomical Regions - Upper Extremity
-                        </SelectItem>
-                        <SelectItem value="Fractures">
-                          Injury Typology - Fractures
-                        </SelectItem>
-                        <SelectItem value="Neurological Injuries">
-                          Injury Typology - Neurological Injuries
-                        </SelectItem>
-                        <SelectItem value="Overuse or Chronic Injuries">
-                          Injury Typology - Overuse/Chronic Injuries
-                        </SelectItem>
-                        <SelectItem value="Soft Tissue Injuries">
-                          Injury Typology - Soft Tissue Injuries
-                        </SelectItem>
-                        <SelectItem value="Workplace or Repetitive Strain">
-                          Injury Typology - Workplace/Repetitive Strain
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
+                        <SelectTrigger
+                          className={`bg-black-700 border-black ${
+                            isAwaitingResponse
+                              ? "opacity-50 cursor-not-allowed"
+                              : ""
+                          }`}
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent className="bg-black border border-gray-700">
+                          {availableVectorStores.map((store) => (
+                            <SelectItem key={store.id} value={store.id}>
+                              {store.display_name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
                   </div>
                 )}
               </div>
