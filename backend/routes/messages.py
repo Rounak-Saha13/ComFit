@@ -5,7 +5,7 @@ import uuid
 import time
 import re
 from fastapi.concurrency import run_in_threadpool
-from schemas import Message, MessageUpdate, FeedbackRequest, TitleRequest, History, BranchItem
+from schemas import Message, MessageUpdate, FeedbackRequest, TitleRequest, History, BranchItem, ChatRequest
 from chat_engine import chat_answer
 from database import supabase, supabase_auth
 
@@ -167,9 +167,11 @@ async def get_conversation_history(
             
             branches_by_edit_id[edit_at_id].append(branch_item)
             
-            # Set current branch index (default to last branch)
+            # Set current branch index (default to original branch if available, otherwise last branch)
             if edit_at_id not in current_branch_index_by_edit_id:
-                current_branch_index_by_edit_id[edit_at_id] = len(branches_by_edit_id[edit_at_id]) - 1
+                # Find original branch index
+                original_index = next((i for i, b in enumerate(branches_by_edit_id[edit_at_id]) if b.is_original), 0)
+                current_branch_index_by_edit_id[edit_at_id] = original_index
             
             # Set active branch
             if is_active:
@@ -247,24 +249,69 @@ async def update_message_feedback(
 @router.post("/messages/{message_id}/regenerate")
 async def regenerate_message(
     message_id: str,
-    request: dict = Body(...),
-    user_id: str = Depends(get_current_user)
+    payload: ChatRequest = Body(...), 
+    user_id: Optional[str] = Depends(get_current_user)
 ):
-    """Regenerate an AI message"""
+    """Regenerate an AI message - stateless, returns fresh content only"""
     try:
         # Verify message ownership through conversation
+        print(f"DEBUG: Looking for message with ID: {message_id}")
+        
+        # First try to find the message in the messages table
         msg_result = supabase.table("messages")\
-            .select("id, conversation_id, content")\
+            .select("id, conversation_id, content, created_at, sender")\
             .eq("id", message_id)\
-            .eq("sender", "ai")\
+            .in_("sender", ["ai", "assistant"])\
             .execute()
         
-        if not msg_result.data:
-            raise HTTPException(status_code=404, detail="AI message not found")
+        print(f"DEBUG: Messages table query result: {msg_result.data}")
         
-        conv_id = msg_result.data[0]["conversation_id"]
+        # If not found in messages table, check branches table
+        if not msg_result.data:
+            print(f"DEBUG: Message not found in messages table, checking branches table")
+            
+            # Get conversation_id from the request payload to narrow down the search
+            request_conversation_id = payload.conversation_id
+            print(f"DEBUG: Looking for message in branches for conversation: {request_conversation_id}")
+            
+            branches_result = supabase.table("branches")\
+                .select("id, conversation_id, messages, edit_at_id")\
+                .eq("conversation_id", request_conversation_id)\
+                .execute()
+            
+            print(f"DEBUG: Found {len(branches_result.data) if branches_result.data else 0} branches for conversation {request_conversation_id}")
+            
+            # Search through branches for this specific conversation
+            found_message = None
+            found_conversation_id = None
+            found_created_at = None
+            
+            for branch in branches_result.data:
+                branch_messages = branch.get("messages", [])
+                print(f"DEBUG: Branch {branch['id']} has {len(branch_messages)} messages")
+                for msg in branch_messages:
+                    if msg.get("id") == message_id and msg.get("sender") in ["ai", "assistant"]:
+                        found_message = msg
+                        found_conversation_id = branch["conversation_id"]
+                        found_created_at = msg.get("created_at")
+                        print(f"DEBUG: Found message in branch {branch['id']}")
+                        break
+                if found_message:
+                    break
+            
+            if found_message:
+                conv_id = found_conversation_id
+                original_created_at = found_created_at
+                print(f"DEBUG: Found message in branch, conversation: {conv_id}, created at: {original_created_at}")
+            else:
+                raise HTTPException(status_code=404, detail="AI message not found")
+        else:
+            conv_id = msg_result.data[0]["conversation_id"]
+            original_created_at = msg_result.data[0]["created_at"]
+            print(f"DEBUG: Found message in messages table, conversation: {conv_id}, created at: {original_created_at}")
         
         # Verify conversation ownership
+        print(f"DEBUG: Verifying ownership of conversation: {conv_id}")
         conv_result = supabase.table("conversations")\
             .select("id")\
             .eq("id", conv_id)\
@@ -274,82 +321,85 @@ async def regenerate_message(
         if not conv_result.data:
             raise HTTPException(status_code=404, detail="Conversation not found")
         
+        print(f"DEBUG: Conversation ownership verified")
+        
         # Get conversation history up to this message
         history_result = supabase.table("messages")\
             .select("*")\
             .eq("conversation_id", conv_id)\
-            .lt("created_at", msg_result.data[0]["created_at"])\
+            .lt("created_at", original_created_at)\
             .order("created_at", desc=False)\
             .execute()
         
-        # Convert to chat engine format
+        # Convert to chat engine format - only include the last user message
         formatted_messages = []
-        for msg in history_result.data:
+        
+        # Find the last user message before the AI message being regenerated
+        last_user_message = None
+        for msg in reversed(history_result.data):
+            if msg["sender"] == "user":
+                last_user_message = msg
+                break
+        
+        if last_user_message:
             formatted_messages.append({
-                "role": msg["sender"],
-                "content": msg["content"]
+                "role": "user",
+                "content": last_user_message["content"]
             })
         
         # Add system prompt if provided
-        if request.get("system_prompt"):
+        if payload.system_prompt:
             formatted_messages.insert(0, {
                 "role": "system",
-                "content": request["system_prompt"]
+                "content": payload.system_prompt
             })
         
-        # Generate new response
+        print(f"DEBUG: Sending to chat engine: {formatted_messages}")
+        
+        # Generate new response using chat engine
         start_time = time.time()
-        ai_content, duration = await chat_answer(
-            messages=formatted_messages,
-            conversation_id=conv_id,
-            model=request.get("model", "gemma3:latest"),
-            preset=request.get("preset", "CFIR"),
-            temperature=request.get("temperature", 0.7),
-            user_id=user_id,
-            rag_method=request.get("rag_method", "No Specific RAG Method"),
-            retrieval_method=request.get("retrieval_method", "local context only")
-        )
+        try:
+            ai_content, duration = await chat_answer(
+                messages=formatted_messages,
+                conversation_id=conv_id,
+                model=payload.model,
+                preset=payload.preset,
+                temperature=payload.temperature,
+                user_id=user_id,
+                rag_method=payload.rag_method,
+                retrieval_method=payload.retrieval_method
+            )
+            
+            if isinstance(ai_content, str) and ai_content.startswith("Error:"):
+                raise HTTPException(status_code=400, detail=ai_content)
+                
+        except Exception as e:
+            print(f"Chat engine error during regeneration: {e}")
+            # Don't save error messages to database - just return the error
+            raise HTTPException(status_code=500, detail=f"AI model error during regeneration: {str(e)}")
         
         actual_duration = int((time.time() - start_time) * 1000)
         
-        # Update the message
-        result = supabase.table("messages")\
-            .update({
-                "content": ai_content,
-                "thinking_time": actual_duration,
-                "model": request.get("model"),
-                "preset": request.get("preset"),
-                "temperature": request.get("temperature"),
-                "rag_method": request.get("rag_method"),
-                "retrieval_method": request.get("retrieval_method"),
-                "updated_at": datetime.utcnow().isoformat()
-            })\
-            .eq("id", message_id)\
-            .execute()
-        row = result.data[0]
-        if result.data:
-            updated_msg = Message(
-                id=message_id,
-                conversation_id=conv_id,
-                sender="ai",
-                content=ai_content,
-                thinking_time=actual_duration,
-                feedback=None,
-                model=request.get("model"),
-                preset=request.get("preset"),
-                temperature=request.get("temperature"),
-                rag_method=request.get("rag_method"),
-                retrieval_method=request.get("retrieval_method"),
-                created_at=datetime.fromisoformat(row["created_at"])
-            )
-            return updated_msg
-        else:
-            raise HTTPException(status_code=500, detail="Failed to update message")
+        # Return fresh content without updating database
+        response_data = {
+            "content": ai_content,
+            "duration": actual_duration,
+            "model": payload.model,
+            "preset": payload.preset,
+            "temperature": payload.temperature,
+            "rag_method": payload.rag_method,
+            "retrieval_method": payload.retrieval_method,
+            "thinking_time": actual_duration
+        }
+        
+        print(f"DEBUG: Returning response data: {response_data}")
+        return response_data
             
     except HTTPException:
         raise
     except Exception as e:
         print(f"Error regenerating message: {e}")
+        # Don't save error messages to database - just return the error
         raise HTTPException(status_code=500, detail=f"Failed to regenerate message: {str(e)}")
 
 @router.post("/title")

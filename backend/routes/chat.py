@@ -40,33 +40,38 @@ async def chat(request: ChatRequest, user_id: str = Depends(get_current_user)):
     try:
         start_time = time.time()
 
+        # Check if this is a branch mode request (has branch_mode flag)
+        is_branch_mode = getattr(request, "branch_mode", False)
+        
         # 0) Save only the *last* user message once; never overwrite by id.
-        last_user = next((m for m in reversed(request.messages) if normalize_sender(m.sender) == "user"), None)
-        if last_user:
-            user_row = {
-                "id": ensure_uuid(last_user.id),
-                "conversation_id": request.conversation_id,
-                "sender": "user",
-                "content": last_user.content,
-                "thinking_time": int(getattr(last_user, "thinking_time", 0) or 0),
-                "feedback": getattr(last_user, "feedback", None),
-                "model": getattr(last_user, "model", request.model),
-                "preset": getattr(last_user, "preset", request.preset),
-                "system_prompt": request.system_prompt,
-                "speculative_decoding": request.speculative_decoding,
-                "temperature": getattr(last_user, "temperature", request.temperature),
-                "top_p": getattr(last_user, "top_p", request.top_p),
-                "strategy": getattr(last_user, "strategy", request.strategy),
-                "rag_method": getattr(last_user, "rag_method", request.rag_method),
-                "retrieval_method": getattr(last_user, "retrieval_method", request.retrieval_method),
-                "user_id": user_id,
-            }
-            # INSERT and ignore duplicates (so edits don't overwrite originals)
-            try:
-                supabase.table("messages").insert(user_row).execute()
-            except Exception as e:
-                # If it's a duplicate-key error, ignore; anything else just log
-                print(f"DEBUG: user insert (ignore duplicates) error: {e}")
+        # Skip saving to messages table if in branch mode
+        if not is_branch_mode:
+            last_user = next((m for m in reversed(request.messages) if normalize_sender(m.sender) == "user"), None)
+            if last_user:
+                user_row = {
+                    "id": ensure_uuid(last_user.id),
+                    "conversation_id": request.conversation_id,
+                    "sender": "user",
+                    "content": last_user.content,
+                    "thinking_time": int(getattr(last_user, "thinking_time", 0) or 0),
+                    "feedback": getattr(last_user, "feedback", None),
+                    "model": getattr(last_user, "model", request.model),
+                    "preset": getattr(last_user, "preset", request.preset),
+                    "system_prompt": request.system_prompt,
+                    "speculative_decoding": request.speculative_decoding,
+                    "temperature": getattr(last_user, "temperature", request.temperature),
+                    "top_p": getattr(last_user, "top_p", request.top_p),
+                    "strategy": getattr(last_user, "strategy", request.strategy),
+                    "rag_method": getattr(last_user, "rag_method", request.rag_method),
+                    "retrieval_method": getattr(last_user, "retrieval_method", request.retrieval_method),
+                    "user_id": user_id,
+                }
+                # INSERT and ignore duplicates (so edits don't overwrite originals)
+                try:
+                    supabase.table("messages").insert(user_row).execute()
+                except Exception as e:
+                    # If it's a duplicate-key error, ignore; anything else just log
+                    print(f"DEBUG: user insert (ignore duplicates) error: {e}")
 
         # 1) Build messages for the LLM
         formatted_messages = []
@@ -94,32 +99,36 @@ async def chat(request: ChatRequest, user_id: str = Depends(get_current_user)):
                 raise HTTPException(status_code=400, detail=ai_content)
         except Exception as e:
             print(f"Chat engine error: {e}")
+            # Don't save error messages to database - just return the error
             raise HTTPException(status_code=500, detail=f"AI model error: {str(e)}")
 
         actual_duration = int((time.time() - start_time) * 1000)
 
-        # 3) Insert AI message
+        # 3) Insert AI message (skip if in branch mode)
         ai_message_id = str(uuid.uuid4())
-        ai_row = {
-            "id": ai_message_id,
-            "conversation_id": request.conversation_id,
-            "sender": "ai",
-            "content": ai_content,
-            "thinking_time": actual_duration,
-            "feedback": None,
-            "model": request.model,
-            "preset": request.preset,
-            "system_prompt": request.system_prompt,
-            "speculative_decoding": request.speculative_decoding,
-            "temperature": request.temperature,
-            "top_p": request.top_p,
-            "strategy": request.strategy,
-            "rag_method": request.rag_method,
-            "retrieval_method": request.retrieval_method,
-            "user_id": user_id,
-        }
-        inserted = supabase.table("messages").insert(ai_row).execute()
-        created_at_str = inserted.data[0]["created_at"] if inserted and inserted.data else datetime.utcnow().isoformat()
+        created_at_str = datetime.utcnow().isoformat()
+        
+        if not is_branch_mode:
+            ai_row = {
+                "id": ai_message_id,
+                "conversation_id": request.conversation_id,
+                "sender": "ai",
+                "content": ai_content,
+                "thinking_time": actual_duration,
+                "feedback": None,
+                "model": request.model,
+                "preset": request.preset,
+                "system_prompt": request.system_prompt,
+                "speculative_decoding": request.speculative_decoding,
+                "temperature": request.temperature,
+                "top_p": request.top_p,
+                "strategy": request.strategy,
+                "rag_method": request.rag_method,
+                "retrieval_method": request.retrieval_method,
+                "user_id": user_id,
+            }
+            inserted = supabase.table("messages").insert(ai_row).execute()
+            created_at_str = inserted.data[0]["created_at"] if inserted and inserted.data else created_at_str
 
         # 4) Respond
         ai_message = Message(
@@ -151,4 +160,5 @@ async def chat(request: ChatRequest, user_id: str = Depends(get_current_user)):
         raise
     except Exception as e:
         print(f"Error in chat endpoint: {e}")
+        # Don't save error messages to database - just return the error
         raise HTTPException(status_code=500, detail=f"Failed to generate response: {str(e)}")

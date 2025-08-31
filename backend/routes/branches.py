@@ -176,10 +176,21 @@ async def create_branch(
             except Exception:
                 tt = 0
             norm_msgs.append({
-                **m,
+                "id": m.get("id"),
                 "conversation_id": conversation_id,
                 "sender": sender,
+                "content": m.get("content", ""),
                 "thinking_time": tt,
+                "feedback": m.get("feedback"),
+                "model": m.get("model"),
+                "preset": m.get("preset"),
+                "system_prompt": m.get("system_prompt"),
+                "speculative_decoding": m.get("speculative_decoding", False),
+                "temperature": m.get("temperature"),
+                "top_p": m.get("top_p"),
+                "strategy": m.get("strategy"),
+                "rag_method": m.get("rag_method"),
+                "retrieval_method": m.get("retrieval_method"),
                 "created_at": m.get("created_at") or datetime.utcnow().isoformat()
             })
 

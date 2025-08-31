@@ -45,12 +45,13 @@ import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import ManageProfile from "@/components/ui/mange-profile";
 import FormattedContent from "@/components/ui/FormattedContent";
+import ErrorMessage from "@/components/ui/ErrorMessage";
 
 // for authentication
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabaseClient";
 import type { User } from "@supabase/supabase-js";
-import { v4 as uuidv4 } from "uuid";
+import { v4 as uuidv4, v4 as uuid } from "uuid";
 
 // types
 interface Message {
@@ -62,6 +63,11 @@ interface Message {
   isThinking?: boolean;
   created_at?: string;
   conversation_id?: string;
+  model?: string;
+  preset?: string;
+  temperature?: number;
+  rag_method?: string;
+  retrieval_method?: string;
 }
 
 interface BranchItem {
@@ -85,6 +91,7 @@ interface ConversationState {
   editAtId?: string;
   branchesByEditId?: Record<string, BranchItem[]>;
   currentBranchIndexByEditId?: Record<string, number>;
+  activeBranchId?: string | null;
 }
 
 interface LoadHistoryResult extends HistoryResponse {
@@ -110,6 +117,11 @@ export default function ChatbotUI() {
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [mechanisticInterpretability, setMechanisticInterpretability] =
     useState(false);
+
+  // Error handling states
+  const [lastError, setLastError] = useState<string | null>(null);
+  const [lastUserInput, setLastUserInput] = useState<string>("");
+  const [showError, setShowError] = useState(false);
 
   // states for enhanced Plus dropdown and active features
   const [showPlusDropdown, setShowPlusDropdown] = useState(false);
@@ -139,120 +151,57 @@ export default function ChatbotUI() {
       currentBranchId,
     });
 
-    // CRITICAL FIX: First, try to find the correct branch messages based on currentBranchId
-    if (
-      conv.branchesByEditId &&
-      Object.keys(conv.branchesByEditId).length > 0
-    ) {
-      // Look for the active branch by currentBranchId
-      if (currentBranchId) {
-        for (const [editId, branches] of Object.entries(
-          conv.branchesByEditId
-        )) {
-          for (const branch of branches) {
-            if (branch.branchId === currentBranchId) {
-              console.log(
-                "DEBUG: getCurrentBranchMessages - Found active branch by ID:",
-                {
-                  branchId: branch.branchId,
-                  messagesCount: branch.messages.length,
-                }
-              );
-              return branch.messages;
-            }
-          }
-        }
-      }
-
-      // If currentBranchId is null, look for the original branch
-      if (currentBranchId === null) {
-        for (const [editId, branches] of Object.entries(
-          conv.branchesByEditId
-        )) {
-          for (const branch of branches) {
-            if (branch.isOriginal) {
-              console.log(
-                "DEBUG: getCurrentBranchMessages - Found original branch:",
-                {
-                  branchId: branch.branchId,
-                  isOriginal: branch.isOriginal,
-                  messagesCount: branch.messages.length,
-                }
-              );
-              return branch.messages;
-            }
-          }
-        }
-
-        // CRITICAL FIX: If no original branch found but we have branches, use the first branch
-        // This handles the case where we're in the initial state
-        if (Object.keys(conv.branchesByEditId).length > 0) {
-          const firstEditId = Object.keys(conv.branchesByEditId)[0];
-          const firstBranches = conv.branchesByEditId[firstEditId];
-          if (firstBranches && firstBranches.length > 0) {
+    // SIMPLIFIED LOGIC: Always prioritize currentBranchId if available
+    if (currentBranchId && conv.branchesByEditId) {
+      for (const [editId, branches] of Object.entries(conv.branchesByEditId)) {
+        for (const branch of branches) {
+          if (branch.branchId === currentBranchId) {
             console.log(
-              "DEBUG: getCurrentBranchMessages - Using first available branch as fallback:",
+              "DEBUG: getCurrentBranchMessages - Found active branch by ID:",
               {
-                editId: firstEditId,
-                branchId: firstBranches[0].branchId,
-                isOriginal: firstBranches[0].isOriginal,
-                messagesCount: firstBranches[0].messages.length,
+                branchId: branch.branchId,
+                messagesCount: branch.messages.length,
               }
             );
-            return firstBranches[0].messages;
+            return branch.messages;
           }
-        }
-      }
-
-      // CRITICAL FIX: If no active branch found, use the current branch index for each edit point
-      for (const [editId, branches] of Object.entries(conv.branchesByEditId)) {
-        const currentIdx = conv.currentBranchIndexByEditId?.[editId] ?? 0;
-        if (branches[currentIdx]) {
-          console.log(
-            "DEBUG: getCurrentBranchMessages - Using current branch index:",
-            {
-              editId,
-              currentIdx,
-              branchId: branches[currentIdx].branchId,
-              messagesCount: branches[currentIdx].messages.length,
-            }
-          );
-          return branches[currentIdx].messages;
-        }
-      }
-
-      // Fallback: use the first available branch
-      for (const [editId, branches] of Object.entries(conv.branchesByEditId)) {
-        if (branches.length > 0) {
-          console.log(
-            "DEBUG: getCurrentBranchMessages - Using first available branch:",
-            {
-              branchId: branches[0].branchId,
-              messagesCount: branches[0].messages.length,
-            }
-          );
-          return branches[0].messages;
         }
       }
     }
 
-    // The main messages field should only be used as a last resort
-    // This is updated when switching branches or loading conversations
+    // If no currentBranchId or branch not found, look for original branch
+    if (
+      conv.branchesByEditId &&
+      Object.keys(conv.branchesByEditId).length > 0
+    ) {
+      for (const [editId, branches] of Object.entries(conv.branchesByEditId)) {
+        const originalBranch = branches.find((b) => b.isOriginal);
+        if (originalBranch) {
+          console.log(
+            "DEBUG: getCurrentBranchMessages - Using original branch:",
+            {
+              branchId: originalBranch.branchId,
+              isOriginal: originalBranch.isOriginal,
+              messagesCount: originalBranch.messages.length,
+            }
+          );
+          return originalBranch.messages;
+        }
+      }
+    }
+
+    // Fallback to main messages field
     if (conv.messages && conv.messages.length > 0) {
       console.log(
-        "DEBUG: getCurrentBranchMessages - Using main messages field as fallback:",
+        "DEBUG: getCurrentBranchMessages - Using main messages field:",
         {
           messagesCount: conv.messages.length,
-          firstMessage: conv.messages[0]?.content?.substring(0, 50) + "...",
-          lastMessage:
-            conv.messages[conv.messages.length - 1]?.content?.substring(0, 50) +
-            "...",
         }
       );
       return conv.messages;
     }
 
-    console.log("DEBUG: getCurrentBranchMessages - No messages found anywhere");
+    console.log("DEBUG: getCurrentBranchMessages - No messages found");
     return [];
   };
 
@@ -286,6 +235,7 @@ export default function ChatbotUI() {
 
   // regenerate functionality
   const [isRegenerating, setIsRegenerating] = useState(false);
+  const [forceUpdate, setForceUpdate] = useState(0);
 
   // states for model selection
   const [selectedModel, setSelectedModel] = useState("gemma3:latest");
@@ -391,6 +341,20 @@ export default function ChatbotUI() {
     setHistory(initialHistory);
     setCurrentIndex(0);
   }, []);
+
+  // Debug effect to log history changes
+  useEffect(() => {
+    console.log("DEBUG: History state changed:", {
+      currentIndex,
+      messagesCount: history[currentIndex]?.messages?.length || 0,
+      messages:
+        history[currentIndex]?.messages?.map((m) => ({
+          id: m.id,
+          sender: m.sender,
+          content: m.content.substring(0, 50) + "...",
+        })) || [],
+    });
+  }, [history, currentIndex, forceUpdate]);
 
   // hook for auto‐scroll to bottom whenever messages change
   useEffect(() => {
@@ -733,6 +697,9 @@ export default function ChatbotUI() {
       )
     );
 
+    // Set awaiting response state
+    setIsAwaitingResponse(true);
+
     // Create abort controller for regeneration
     const controller = new AbortController();
     setAbortController(controller);
@@ -747,89 +714,411 @@ export default function ChatbotUI() {
       }
 
       const msgs = history[currentIndex].messages;
-      const idx = msgs.findIndex((m) => m.id === aiMessageId);
-      const slice = msgs.slice(0, idx);
-      const guestHistory = slice.map((m) => ({
+      let idx = msgs.findIndex((m) => m.id === aiMessageId);
+      let messageFound = false;
+      let originalMessage = null;
+
+      console.log("DEBUG: Looking for AI message with ID:", aiMessageId);
+      console.log(
+        "DEBUG: Available message IDs:",
+        msgs.map((m) => ({ id: m.id, sender: m.sender }))
+      );
+
+      // First try to find in main conversation messages
+      if (idx !== -1) {
+        messageFound = true;
+        originalMessage = msgs[idx];
+        console.log("DEBUG: Found message in main conversation at index:", idx);
+      } else {
+        // If not found in main messages, check branches
+        console.log(
+          "DEBUG: Message not found in main conversation, checking branches..."
+        );
+        const conv = history[currentIndex];
+
+        if (conv.branchesByEditId) {
+          for (const [editId, branches] of Object.entries(
+            conv.branchesByEditId
+          )) {
+            for (const branch of branches) {
+              const branchMessage = branch.messages.find(
+                (m) => m.id === aiMessageId
+              );
+              if (branchMessage) {
+                messageFound = true;
+                originalMessage = branchMessage;
+                console.log("DEBUG: Found message in branch:", {
+                  editId,
+                  branchId: branch.branchId,
+                });
+                break;
+              }
+            }
+            if (messageFound) break;
+          }
+        }
+      }
+
+      if (!messageFound || !originalMessage) {
+        console.error(
+          "DEBUG: AI message not found in conversation or branches"
+        );
+        console.error("DEBUG: msgs array:", msgs);
+        console.error(
+          "DEBUG: branchesByEditId:",
+          history[currentIndex].branchesByEditId
+        );
+        throw new Error(
+          `AI message with ID ${aiMessageId} not found in conversation or branches`
+        );
+      }
+
+      console.log("DEBUG: Found original message:", originalMessage);
+
+      // If we found the message in a branch, we need to get the conversation slice differently
+      let slice: any[];
+      if (idx !== -1) {
+        // Message is in main conversation
+        slice = msgs.slice(0, idx);
+      } else {
+        // Message is in a branch, we need to find the branch that contains this message
+        const conv = history[currentIndex];
+        let branchSlice: any[] = [];
+
+        if (conv.branchesByEditId) {
+          for (const [editId, branches] of Object.entries(
+            conv.branchesByEditId
+          )) {
+            for (const branch of branches) {
+              if (branch.messages) {
+                const messageIndex = branch.messages.findIndex(
+                  (m: any) => m.id === aiMessageId
+                );
+                if (messageIndex !== -1) {
+                  branchSlice = branch.messages.slice(0, messageIndex);
+                  break;
+                }
+              }
+            }
+            if (branchSlice.length > 0) break;
+          }
+        }
+        slice = branchSlice;
+      }
+      const guestHistory = slice.map((m: any) => ({
+        id: m.id, // Use original message ID
         role: m.sender,
         content: m.content,
       }));
 
-      const res = await fetch(
+      const regenerateRes = await fetch(
         `${API_URL}/api/messages/${aiMessageId}/regenerate`,
         {
           method: "POST",
           headers,
           body: JSON.stringify({
             conversation_id: conversations[currentIndex].id,
-            history: guestHistory,
+            messages: guestHistory.map((msg) => ({
+              id: msg.id, // Use original message ID instead of generating new ones
+              content: msg.content,
+              sender: msg.role,
+              conversation_id: conversations[currentIndex].id, // Add conversation_id to each message
+              thinking_time: 0, // Required field for MessageCreate
+              feedback: null,
+              model: null,
+              preset: null,
+              temperature: null,
+              top_p: null,
+              rag_method: null,
+              retrieval_method: null,
+              strategy: null,
+            })),
             model: selectedModel,
             preset,
             temperature,
+            top_p: 1.0,
+            speculative_decoding: false, // Required field
             rag_method: selectedRagMethod,
             retrieval_method: selectedRetrievalMethod,
+            system_prompt: undefined,
+            strategy: undefined,
+            branch_mode: false,
           }),
           signal: controller.signal,
         }
       );
 
-      if (!res.ok) throw new Error("Regeneration failed");
+      if (!regenerateRes.ok) {
+        const errorText = await regenerateRes.text();
+        const errorMessage = `Regeneration failed: ${regenerateRes.status} - ${errorText}`;
+        setLastError(errorMessage);
+        setShowError(true);
+        throw new Error(errorMessage);
+      }
 
-      // backend returns the updated Message object
-      const updatedMsg = await res.json();
+      console.log("DEBUG: Regenerate response status:", regenerateRes.status);
+      console.log(
+        "DEBUG: Regenerate response headers:",
+        Object.fromEntries(regenerateRes.headers.entries())
+      );
+
+      // Get the fresh AI content
+      const freshContent = await regenerateRes.json();
+      console.log("DEBUG: Regenerate response:", freshContent);
+      console.log("DEBUG: freshContent type:", typeof freshContent);
+      console.log("DEBUG: freshContent keys:", Object.keys(freshContent || {}));
+      console.log(
+        "DEBUG: freshContent stringified:",
+        JSON.stringify(freshContent, null, 2)
+      );
+
+      // Check if response is wrapped in a data property
+      let actualContent = freshContent;
+      if (freshContent && freshContent.data) {
+        console.log(
+          "DEBUG: Response wrapped in 'data' property, using freshContent.data"
+        );
+        actualContent = freshContent.data;
+      }
+
+      // Validate the response
+      if (!actualContent || !actualContent.content) {
+        console.error("DEBUG: Invalid response from regenerate endpoint:", {
+          freshContent,
+          actualContent,
+        });
+        throw new Error(
+          `Invalid response from regenerate endpoint: ${JSON.stringify(
+            freshContent
+          )}`
+        );
+      }
+
+      console.log("DEBUG: Using actualContent:", actualContent);
+      console.log("DEBUG: actualContent.content:", actualContent.content);
+      console.log(
+        "DEBUG: actualContent.content type:",
+        typeof actualContent.content
+      );
+
+      // Create a proper branch structure for the regenerated message
+      const conv = history[currentIndex];
+      const eid = aiMessageId;
+
+      // Get existing branches or create new structure
+      const existing = conv.branchesByEditId?.[eid] ?? [];
+
+      // Create branch items
+      const originalBranchItem = {
+        messages: slice.concat([
+          {
+            id: aiMessageId,
+            content: originalMessage.content, // Original content
+            sender: "assistant",
+            thinkingTime: originalMessage.thinkingTime,
+            feedback: originalMessage.feedback,
+            model: originalMessage.model,
+            preset: originalMessage.preset,
+            temperature: originalMessage.temperature,
+            rag_method: originalMessage.rag_method,
+            retrieval_method: originalMessage.retrieval_method,
+            created_at: originalMessage.created_at || new Date().toISOString(),
+          },
+        ]),
+        branchId: null,
+        isOriginal: true,
+      };
+
+      const regeneratedBranchItem = {
+        messages: slice.concat([
+          {
+            id: aiMessageId,
+            content: actualContent.content, // New regenerated content
+            sender: "assistant",
+            thinkingTime:
+              actualContent.thinking_time || actualContent.duration || 0,
+            feedback: null,
+            model: actualContent.model,
+            preset: actualContent.preset,
+            temperature: actualContent.temperature,
+            rag_method: actualContent.rag_method,
+            retrieval_method: actualContent.retrieval_method,
+            created_at: new Date().toISOString(),
+          },
+        ]),
+        branchId: `regenerated_${Date.now()}`, // Generate unique branch ID
+        isOriginal: false,
+      };
+
+      const updatedList = [originalBranchItem, regeneratedBranchItem];
+
+      const updatedBranchesByEditId = {
+        ...(conv.branchesByEditId || {}),
+        [eid]: updatedList,
+      };
+
+      const updatedBranchIndexByEditId = {
+        ...(conv.currentBranchIndexByEditId || {}),
+        [eid]: 1, // Set to regenerated branch (index 1)
+      };
+
+      // Update state with new branch structure
+      console.log("DEBUG: Updating history state with regenerated content");
+      console.log("DEBUG: Original message content:", originalMessage.content);
+      console.log("DEBUG: Regenerated content:", actualContent.content);
+      console.log(
+        "DEBUG: Thinking time from backend:",
+        actualContent.thinking_time
+      );
+      console.log("DEBUG: Duration from backend:", actualContent.duration);
+      console.log(
+        "DEBUG: Regenerated branch messages:",
+        regeneratedBranchItem.messages
+      );
+      console.log(
+        "DEBUG: Current history state before update:",
+        history[currentIndex]
+      );
 
       setHistory((prev) => {
         const copy = [...prev];
-        // replace the old AI message with the regenerated one
-        copy[currentIndex].messages = copy[currentIndex].messages.map((m) =>
-          m.id === aiMessageId
-            ? {
-                id: updatedMsg.id,
-                content: updatedMsg.content,
-                sender: "assistant",
-                thinkingTime: updatedMsg.thinking_time,
-                feedback: updatedMsg.feedback,
-                isThinking: false,
-              }
-            : m
-        );
+        copy[currentIndex] = {
+          ...conv,
+          messages: regeneratedBranchItem.messages, // Show regenerated response
+          branchesByEditId: updatedBranchesByEditId,
+          currentBranchIndexByEditId: updatedBranchIndexByEditId,
+          originalMessages: originalBranchItem.messages, // Keep original for reference
+        };
+
+        console.log("DEBUG: History state updated:", copy[currentIndex]);
+        console.log("DEBUG: New messages array:", copy[currentIndex].messages);
         return copy;
       });
-    } catch (err: any) {
-      if (err.name === "AbortError") {
-        // Handle cancellation
+
+      try {
+        const branchPayload = {
+          edit_at_id: aiMessageId,
+          messages: regeneratedBranchItem.messages,
+          original_messages: originalBranchItem.messages,
+        };
+
+        console.log("DEBUG: Saving branch to database (regen):", branchPayload);
+        console.log(
+          "DEBUG: Regenerated message thinking time:",
+          regeneratedBranchItem.messages.find((m) => m.id === aiMessageId)
+            ?.thinkingTime
+        );
+        const branchRes = await fetch(
+          `${API_URL}/api/messages/conversations/${conversations[currentIndex].id}/branches`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify(branchPayload),
+            signal: controller.signal,
+          }
+        );
+        if (!branchRes.ok) throw new Error("Failed to save regen branch");
+        const created = await branchRes.json();
+
+        // mark as active
+        await fetch(`${API_URL}/api/branches/${created.branchId}/activate`, {
+          method: "POST",
+          headers,
+        });
+
         setHistory((prev) => {
           const copy = [...prev];
-          copy[currentIndex].messages = copy[currentIndex].messages.map((m) =>
-            m.id === aiMessageId
-              ? {
-                  ...m,
-                  content: "Regeneration cancelled",
-                  isThinking: false,
-                  thinkingTime: undefined,
-                }
-              : m
+          const convo = copy[currentIndex];
+          const branchesByEditId = { ...(convo.branchesByEditId || {}) };
+          const list = [...(branchesByEditId[aiMessageId] || [])];
+
+          // Add the original message as the first branch if it doesn't exist
+          if (list.length === 0) {
+            const originalBranch = {
+              branchId: null, // Original branch has no ID
+              isOriginal: true,
+              messages: originalBranchItem.messages,
+            };
+            list.push(originalBranch);
+            console.log("DEBUG: Added original branch:", originalBranch);
+          }
+
+          // push new branch
+          list.push({
+            branchId: created.branchId,
+            isOriginal: false,
+            messages: regeneratedBranchItem.messages,
+          });
+
+          branchesByEditId[aiMessageId] = list;
+          const idxMap = { ...(convo.currentBranchIndexByEditId || {}) };
+          idxMap[aiMessageId] = list.length - 1;
+
+          copy[currentIndex] = {
+            ...convo,
+            branchesByEditId,
+            currentBranchIndexByEditId: idxMap,
+            activeBranchId: created.branchId,
+            messages: regeneratedBranchItem.messages,
+          };
+
+          console.log("DEBUG: Updated history state with regenerated content");
+          console.log(
+            "DEBUG: New messages array:",
+            copy[currentIndex].messages
           );
+          console.log(
+            "DEBUG: New activeBranchId:",
+            copy[currentIndex].activeBranchId
+          );
+          console.log(
+            "DEBUG: Branch structure created:",
+            branchesByEditId[aiMessageId]
+          );
+          console.log("DEBUG: Branch count:", list.length);
+          console.log("DEBUG: hasMultipleBranches check:", list.length > 1);
+
+          setTimeout(() => {
+            const hasBranches = hasMultipleBranches(aiMessageId);
+            console.log("DEBUG: hasMultipleBranches result:", hasBranches);
+            console.log(
+              "DEBUG: Current branchesByEditId:",
+              copy[currentIndex].branchesByEditId
+            );
+          }, 100);
+
           return copy;
         });
-        return;
-      }
-      console.error("Regeneration error:", err);
 
-      // Restore original content on error
-      setHistory((prev) => {
-        const copy = [...prev];
-        copy[currentIndex].messages = copy[currentIndex].messages.map((m) =>
-          m.id === aiMessageId
-            ? {
-                ...m,
-                content: "Regeneration failed. Please try again.",
-                isThinking: false,
-                thinkingTime: undefined,
-              }
-            : m
-        );
-        return copy;
-      });
+        // force rerender
+        console.log("DEBUG: Forcing re-render after state update");
+        setForceUpdate((prev: number) => prev + 1);
+      } catch (e) {
+        console.error("DEBUG: Error saving branch to database (regen):", e);
+        setHistory((prev) => {
+          const copy = [...prev];
+          copy[currentIndex] = {
+            ...copy[currentIndex],
+            messages: copy[currentIndex].messages.map((m) =>
+              m.id === aiMessageId
+                ? { ...m, content: "Regeneration failed", isThinking: false }
+                : m
+            ),
+          };
+          return copy;
+        });
+      } finally {
+        setIsRegenerating(false);
+        setAbortController(null);
+        setIsAwaitingResponse(false);
+      }
+    } catch (err: any) {
+      if (err?.name !== "AbortError") {
+        console.error("Error in handleRegenerate:", err);
+        const errorMessage = err.message || "An unexpected error occurred";
+        setLastError(errorMessage);
+        setShowError(true);
+      }
     } finally {
       setIsRegenerating(false);
       setAbortController(null);
@@ -1326,12 +1615,17 @@ export default function ChatbotUI() {
       return responseData;
     } catch (error) {
       console.error("DEBUG: Fetch error:", error);
+      // Don't set error state here as this function is called from other places
+      // that handle their own error states
       throw error;
     }
   };
 
   // generate AI response locally for branches (doesn't save to messages table)
-  const generateAIResponseLocal = async (messages: any[], model: string) => {
+  const generateAIResponseLocal = async (
+    messages: any[],
+    model: string
+  ): Promise<{ result: string; thinkingTime: number }> => {
     console.log("DEBUG: generateAIResponseLocal called for branch");
 
     const {
@@ -1366,6 +1660,7 @@ export default function ChatbotUI() {
       preset,
       rag_method: selectedRagMethod,
       retrieval_method: selectedRetrievalMethod,
+      branch_mode: true, // This is a branch request
     };
 
     if (session?.access_token) {
@@ -1387,15 +1682,20 @@ export default function ChatbotUI() {
       }
 
       const responseData = await response.json();
-      // Return only the AI response text, not the full response object
-      return responseData.result;
+      // Return both the AI response text and thinking time
+      return {
+        result: responseData.result,
+        thinkingTime: responseData.duration || 0,
+      };
     } catch (error) {
       console.error("DEBUG: Fetch error in generateAIResponseLocal:", error);
+      // Don't set error state here as this function is called from other places
+      // that handle their own error states
       throw error;
     }
   };
 
-  var limitReached = false;
+  let limitReached = false;
   const hasMultipleBranches = (messageId: string): boolean => {
     const conv = history[currentIndex];
     if (!conv) return false;
@@ -1436,6 +1736,10 @@ export default function ChatbotUI() {
 
   const handleSendMessage = async () => {
     if (!inputValue.trim() || isAwaitingResponse) return;
+
+    // Store the user input for potential retry
+    const userInput = inputValue.trim();
+    setLastUserInput(userInput);
 
     // --- auth ---
     const {
@@ -1513,27 +1817,84 @@ export default function ChatbotUI() {
           ? branch.messages
           : [];
 
-        // Generate AI on client using branch context + user message (don't save to messages table)
-        const messagesForAI = [...base, userMessage];
-        const aiResp = await generateAIResponseLocal(
-          messagesForAI,
-          selectedModel
-        );
+        // Add user message to UI immediately
+        const messagesWithUser = [...base, userMessage];
+
+        // Update UI to show user message and thinking state
+        setHistory((prev) => {
+          const copy = [...prev];
+          const c = copy[currentIndex];
+
+          // Create a temporary AI message with thinking state
+          const tempAi: Message = {
+            id: uuidv4(),
+            content: "",
+            sender: "assistant",
+            isThinking: true,
+            thinkingTime: 0,
+          };
+
+          const tempBranched = [...messagesWithUser, tempAi];
+
+          const list = (c.branchesByEditId?.[editId] || []).slice();
+          list[index] = { ...list[index], messages: tempBranched };
+
+          copy[currentIndex] = {
+            ...c,
+            messages: tempBranched,
+            branchesByEditId: {
+              ...(c.branchesByEditId || {}),
+              [editId]: list,
+            },
+          };
+          return copy;
+        });
+
+        // Generate AI response
+        let aiResp;
+        try {
+          aiResp = await generateAIResponseLocal(
+            messagesWithUser,
+            selectedModel
+          );
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error
+              ? error.message
+              : "Failed to generate AI response";
+          setLastError(errorMessage);
+          setShowError(true);
+          throw error;
+        }
 
         const newAi: Message = {
           id: uuidv4(),
-          content: aiResp,
+          content: aiResp.result,
           sender: "assistant",
-          thinkingTime: 0, // No thinking time for branches
+          thinkingTime: aiResp.thinkingTime,
+          isThinking: false,
         };
 
-        const uiBranched = [...messagesForAI, newAi];
+        const uiBranched = [...messagesWithUser, newAi];
 
         // Backend payload for PATCH /api/branches/{id}
         const payload = uiBranched.map((m) => ({
-          ...toBackendMessage(m),
+          id: m.id,
           conversation_id: conversationId,
           sender: m.sender === "assistant" ? "ai" : "user",
+          content: m.content,
+          thinking_time: m.thinkingTime || 0,
+          feedback: m.feedback,
+          model: selectedModel,
+          preset: preset,
+          system_prompt: systemPrompt,
+          speculative_decoding: specDecoding,
+          temperature: temperature,
+          top_p: topP,
+          strategy: strategy,
+          rag_method: selectedRagMethod,
+          retrieval_method: selectedRetrievalMethod,
+          created_at: m.created_at || new Date().toISOString(),
         }));
 
         const branchUpdateRes = await fetch(
@@ -1546,9 +1907,10 @@ export default function ChatbotUI() {
         );
         if (!branchUpdateRes.ok) {
           const body = await branchUpdateRes.text();
-          throw new Error(
-            `Branch update failed: ${branchUpdateRes.status} ${body}`
-          );
+          const errorMessage = `Branch update failed: ${branchUpdateRes.status} - ${body}`;
+          setLastError(errorMessage);
+          setShowError(true);
+          throw new Error(errorMessage);
         }
 
         // Update UI state: active chat view + the specific branch
@@ -1569,6 +1931,9 @@ export default function ChatbotUI() {
           };
           return copy;
         });
+
+        // Clear thinking state
+        setIsAwaitingResponse(false);
 
         // persist branches locally
         try {
@@ -1594,12 +1959,19 @@ export default function ChatbotUI() {
       // ======================
       // MAINLINE MODE (/api/chat)
       // ======================
-      // Optimistically render user message
+      // Optimistically render user message and add thinking state
       setHistory((prev) => {
         const copy = [...prev];
+        const tempAi: Message = {
+          id: uuidv4(),
+          content: "",
+          sender: "assistant",
+          isThinking: true,
+          thinkingTime: 0,
+        };
         copy[currentIndex] = {
           ...copy[currentIndex],
-          messages: [...copy[currentIndex].messages, userMessage],
+          messages: [...copy[currentIndex].messages, userMessage, tempAi],
           editAtId: undefined,
         };
         return copy;
@@ -1630,6 +2002,7 @@ export default function ChatbotUI() {
         preset,
         rag_method: selectedRagMethod,
         retrieval_method: selectedRetrievalMethod,
+        branch_mode: false, // Mainline mode
       };
 
       const res = await fetch(`${API_URL}/api/chat`, {
@@ -1646,7 +2019,10 @@ export default function ChatbotUI() {
       }
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(`Chat API error: ${res.status} - ${text}`);
+        const errorMessage = `Chat API error: ${res.status} - ${text}`;
+        setLastError(errorMessage);
+        setShowError(true);
+        throw new Error(errorMessage);
       }
 
       const responseData = await res.json();
@@ -1657,11 +2033,16 @@ export default function ChatbotUI() {
         content: ai_message.content,
         sender: ai_message.sender === "ai" ? "assistant" : ai_message.sender,
         thinkingTime: ai_message?.thinking_time ?? duration ?? 0,
+        isThinking: false,
       };
 
       setHistory((prev) => {
         const copy = [...prev];
-        const updated = [...copy[currentIndex].messages, newMessage];
+        // Replace the thinking message with the real AI response
+        const messagesWithoutThinking = copy[currentIndex].messages.filter(
+          (m) => !m.isThinking
+        );
+        const updated = [...messagesWithoutThinking, newMessage];
 
         copy[currentIndex] = {
           ...copy[currentIndex],
@@ -1674,27 +2055,32 @@ export default function ChatbotUI() {
       // Title generation (first turn)
       const wasFirst = prior.length === 0;
       if (wasFirst) {
-        const titleRes = await fetch(`${API_URL}/api/title`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            conversation_id: conversationId,
-            user_message: userMessage.content,
-            ai_response: aiText,
-          }),
-        });
-        if (titleRes.ok) {
-          const { title: finalTitle } = await titleRes.json();
-          setConversations((prev) =>
-            prev.map((c, i) =>
-              i === currentIndex ? { ...c, title: finalTitle } : c
-            )
-          );
-          await fetch(`${API_URL}/api/conversations/${conversationId}`, {
-            method: "PATCH",
+        try {
+          const titleRes = await fetch(`${API_URL}/api/title`, {
+            method: "POST",
             headers,
-            body: JSON.stringify({ title: finalTitle }),
+            body: JSON.stringify({
+              conversation_id: conversationId,
+              user_message: userMessage.content,
+              ai_response: aiText,
+            }),
           });
+          if (titleRes.ok) {
+            const { title: finalTitle } = await titleRes.json();
+            setConversations((prev) =>
+              prev.map((c, i) =>
+                i === currentIndex ? { ...c, title: finalTitle } : c
+              )
+            );
+            await fetch(`${API_URL}/api/conversations/${conversationId}`, {
+              method: "PATCH",
+              headers,
+              body: JSON.stringify({ title: finalTitle }),
+            });
+          }
+        } catch (error) {
+          console.error("Error generating title:", error);
+          // Don't set error state for title generation as it's not critical
         }
       }
 
@@ -1702,11 +2088,34 @@ export default function ChatbotUI() {
     } catch (err: any) {
       if (err?.name !== "AbortError") {
         console.error("Error in handleSendMessage:", err);
+        // Set error state for UI display
+        const errorMessage = err.message || "An unexpected error occurred";
+        setLastError(errorMessage);
+        setShowError(true);
       }
     } finally {
       setAbortController(null);
       setIsAwaitingResponse(false);
     }
+  };
+
+  // Retry last failed request
+  const handleRetry = () => {
+    if (lastUserInput && !isAwaitingResponse) {
+      setShowError(false);
+      setLastError(null);
+      setInputValue(lastUserInput);
+      // Small delay to ensure state updates before sending
+      setTimeout(() => {
+        handleSendMessage();
+      }, 100);
+    }
+  };
+
+  // Dismiss error
+  const handleDismissError = () => {
+    setShowError(false);
+    setLastError(null);
   };
 
   // cancel current AI request
@@ -1849,16 +2258,24 @@ export default function ChatbotUI() {
       }
 
       // get AI reply (branch response)
-      const aiResp = await generateAIResponseLocal(
-        messagesUpToEdit,
-        selectedModel
-      );
+      let aiResp;
+      try {
+        aiResp = await generateAIResponseLocal(messagesUpToEdit, selectedModel);
+      } catch (error) {
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : "Failed to generate AI response";
+        setLastError(errorMessage);
+        setShowError(true);
+        throw error;
+      }
 
       const newAi: Message = {
         id: uuidv4(),
-        content: aiResp,
+        content: aiResp.result,
         sender: "assistant",
-        thinkingTime: 0, // TODO: track thinking time or add later in backend
+        thinkingTime: aiResp.thinkingTime,
       };
 
       const uiBranchedMessages = [...messagesUpToEdit, newAi];
@@ -1870,9 +2287,22 @@ export default function ChatbotUI() {
       }));
 
       const payloadMessages = uiBranchedMessages.map((m) => ({
-        ...toBackendMessage(m),
+        id: m.id,
         conversation_id: convId,
         sender: m.sender === "assistant" ? "ai" : "user",
+        content: m.content,
+        thinking_time: m.thinkingTime || 0,
+        feedback: m.feedback,
+        model: selectedModel,
+        preset: preset,
+        system_prompt: systemPrompt,
+        speculative_decoding: specDecoding,
+        temperature: temperature,
+        top_p: topP,
+        strategy: strategy,
+        rag_method: selectedRagMethod,
+        retrieval_method: selectedRetrievalMethod,
+        created_at: m.created_at || new Date().toISOString(),
       }));
 
       console.log("DEBUG: commitEdit - Sending to backend:");
@@ -1919,9 +2349,11 @@ export default function ChatbotUI() {
       );
 
       if (!branchResponse.ok) {
-        throw new Error(
-          `Failed to create branch: ${branchResponse.status} ${branchResponse.statusText}`
-        );
+        const errorText = await branchResponse.text();
+        const errorMessage = `Failed to create branch: ${branchResponse.status} - ${errorText}`;
+        setLastError(errorMessage);
+        setShowError(true);
+        throw new Error(errorMessage);
       }
 
       const { branch_id } = await branchResponse.json();
@@ -1991,6 +2423,13 @@ export default function ChatbotUI() {
       }
     } catch (error) {
       console.error("Error creating branch:", error);
+
+      // Set error state for UI display
+      const errorMessage =
+        error instanceof Error ? error.message : "Failed to create branch";
+      setLastError(errorMessage);
+      setShowError(true);
+
       // restore UI on error
       setHistory((prev) => {
         const copy = [...prev];
@@ -2027,8 +2466,12 @@ export default function ChatbotUI() {
     if (branches.length <= 1) return;
     const prevIdx = (currentIdx - 1 + branches.length) % branches.length;
     const selectedBranch = branches[prevIdx];
-    // for debug
-    await activateBranch(selectedBranch.branchId);
+
+    // Activate branch in backend
+    if (selectedBranch.branchId) {
+      await activateBranch(selectedBranch.branchId);
+    }
+
     console.log("selectedBranch.messages", selectedBranch.messages);
     setHistory((prev) => {
       const newHist = [...prev];
@@ -2053,7 +2496,12 @@ export default function ChatbotUI() {
     if (branches.length <= 1) return;
     const nextIdx = (currentIdx + 1) % branches.length;
     const selectedBranch = branches[nextIdx];
-    await activateBranch(selectedBranch.branchId);
+
+    // Activate branch in backend
+    if (selectedBranch.branchId) {
+      await activateBranch(selectedBranch.branchId);
+    }
+
     setHistory((prev) => {
       const newHist = [...prev];
       newHist[currentIndex] = {
@@ -3163,7 +3611,7 @@ export default function ChatbotUI() {
                           message.sender === "ai") && (
                           <div className="w-full max-w-none px-4">
                             {message.isThinking ? (
-                              // Show only thinking indicator during regeneration
+                              // Show only thinking indicator during thinking
                               <div className="text-white py-3 w-full px-0">
                                 <div className="flex items-center gap-2">
                                   <div className="w-2 h-2 bg-gray-500 rounded-full animate-pulse"></div>
@@ -3334,6 +3782,64 @@ export default function ChatbotUI() {
                                       <Copy className="w-4 h-4" />
                                     )}
                                   </button>
+
+                                  {/* Branch navigation for AI messages */}
+                                  {hasMultipleBranches(message.id) && (
+                                    <>
+                                      <button
+                                        onClick={() => goToPrev(message.id)}
+                                        disabled={
+                                          getBranchIndex(message.id) === 0 ||
+                                          isAwaitingResponse
+                                        }
+                                        className={`p-1 rounded cursor-pointer ${
+                                          getBranchIndex(message.id) === 0 ||
+                                          isAwaitingResponse
+                                            ? "text-muted-foreground cursor-not-allowed"
+                                            : "text-muted-foreground hover:text-foreground hover:bg-accent"
+                                        }`}
+                                        title={
+                                          isAwaitingResponse
+                                            ? "Please wait for current operation to complete"
+                                            : "Go to previous branch"
+                                        }
+                                      >
+                                        <ArrowLeft className="w-4 h-4" />
+                                      </button>
+                                      <span className="text-xs text-muted-foreground px-0.5 flex items-center">
+                                        {getBranchIndex(message.id) + 1} /{" "}
+                                        {history[currentIndex]
+                                          .branchesByEditId?.[message.id]
+                                          ?.length ?? 1}
+                                      </span>
+                                      <button
+                                        onClick={() => goToNext(message.id)}
+                                        disabled={
+                                          getBranchIndex(message.id) + 1 ===
+                                            (history[currentIndex]
+                                              .branchesByEditId?.[message.id]
+                                              ?.length ?? 0) ||
+                                          isAwaitingResponse
+                                        }
+                                        className={`p-1 rounded cursor-pointer ${
+                                          getBranchIndex(message.id) + 1 ===
+                                            (history[currentIndex]
+                                              .branchesByEditId?.[message.id]
+                                              ?.length ?? 0) ||
+                                          isAwaitingResponse
+                                            ? "text-muted-foreground cursor-not-allowed"
+                                            : "text-muted-foreground hover:text-foreground hover:bg-accent"
+                                        }`}
+                                        title={
+                                          isAwaitingResponse
+                                            ? "Please wait for current operation to complete"
+                                            : "Go to next branch"
+                                        }
+                                      >
+                                        <ArrowRight className="w-4 h-4" />
+                                      </button>
+                                    </>
+                                  )}
                                 </div>
                               </>
                             )}
@@ -3343,6 +3849,19 @@ export default function ChatbotUI() {
                     </div>
                   );
                 })}
+
+                {/* Error Message Display */}
+                {showError && lastError && (
+                  <div className="w-full">
+                    <ErrorMessage
+                      error={lastError}
+                      onRetry={handleRetry}
+                      showRetry={true}
+                      className="max-w-none"
+                      previousInput={lastUserInput}
+                    />
+                  </div>
+                )}
 
                 {isAwaitingResponse && (
                   <div className="flex gap-3 sm:gap-4">

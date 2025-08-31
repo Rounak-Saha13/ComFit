@@ -87,6 +87,7 @@ class ChatRequest(BaseModel):
     speculative_decoding: bool
     system_prompt: Optional[str] = "You are a helpful AI assistant for comfort and fitting clothing"
     strategy: Optional[str] = None
+    branch_mode: Optional[bool] = False  # Flag to indicate if this is a branch request
 
 class ChatResponse(BaseModel):
     result: str
