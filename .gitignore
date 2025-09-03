@@ -1,3 +1,5 @@
 #vector store
 *.duckdb
 /vector_store
+/backend/__pycache__
+/frontend/node_modules
