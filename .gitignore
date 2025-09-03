@@ -3,3 +3,5 @@
 /vector_store
 /backend/__pycache__
 /frontend/node_modules
+/backend/chat_engine/__pycache__
+*.pyc
