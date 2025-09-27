@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 from dotenv import load_dotenv
 import os
@@ -23,7 +24,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",  
+        "http://localhost:3000",
         "http://localhost:3001",
     ],
     allow_credentials=True,
@@ -31,7 +32,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# routers
+# Routers
 app.include_router(chat.router, prefix="/api", tags=["chat"])
 app.include_router(conversations.router, prefix="/api", tags=["conversations"])
 app.include_router(messages.router, prefix="/api", tags=["messages"])
@@ -40,19 +41,27 @@ app.include_router(documents.router, prefix="/api", tags=["documents"])
 app.include_router(models.router, prefix="/api", tags=["models"])
 app.include_router(vector_stores.router, prefix="/api", tags=["vector-stores"])
 
+# Serve images statically
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+app.mount(
+    "/images",
+    StaticFiles(directory="D:/Sahithi/9_3_2025_ComFit/ComFit/extracted_images_for_upload"),
+    name="images"
+)
+
+
+
 @app.on_event("startup")
 async def startup_event():
-    """
-    Initialize database tables on startup
-    """
+    """Initialize database tables on startup"""
     await create_tables()
     print("Database tables created/verified")
 
 @app.get("/")
 async def root():
-    """
-    Root endpoint
-    """
     return {
         "message": "Comfit Copilot API",
         "version": "1.0.0",
@@ -61,19 +70,17 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """
-    Health check endpoint
-    """
     print("DEBUG: Health check endpoint called")
     return {"status": "healthy", "message": "Comfit Copilot API is running"}
 
 @app.get("/api/health")
 async def api_health_check():
-    """
-    API health check endpoint
-    """
     print("DEBUG: API health check endpoint called")
-    return {"status": "healthy", "message": "Comfit Copilot API is running", "endpoint": "/api/health"}
+    return {
+        "status": "healthy",
+        "message": "Comfit Copilot API is running",
+        "endpoint": "/api/health"
+    }
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))

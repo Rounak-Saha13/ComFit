@@ -1,3 +1,4 @@
+
 import os
 from .client import ChatEngine
 
@@ -14,12 +15,13 @@ async def chat_answer(
     preset: str,
     temperature: float,
     user_id: str = None,
-    rag_method: str = "No Specific RAG Method",
+    # CORRECTED: Set a valid default RAG strategy to prevent errors.
+    rag_method: str = "rac_enhanced_hybrid_rag",
     retrieval_method: str = "local context only"
 ) -> tuple[str, int]:
     """
     Generate a chat response using the chat engine.
-    
+
     Args:
         messages: List of message dictionaries with 'role' and 'content' keys
         conversation_id: ID of the conversation
@@ -27,7 +29,7 @@ async def chat_answer(
         preset: Preset configuration
         temperature: Temperature setting
         user_id: Optional user ID
-        
+
     Returns:
         Tuple of (response_text, duration_ms)
     """
@@ -39,32 +41,33 @@ async def chat_answer(
     print(f"  - preset: {preset}")
     print(f"  - temperature: {temperature}")
     print(f"  - user_id: {user_id}")
-    
-    # Convert messages to the format expected by ChatEngine
+
+    # CORRECTED: Reformat ALL messages, including system messages.
     formatted_messages = []
     for msg in messages:
-        if msg["role"] == "system":
-            continue  # Skip system messages for now
         formatted_messages.append({
             "sender": msg["role"],
             "content": msg["content"]
         })
-    
+
     print(f"DEBUG: Formatted messages: {formatted_messages}")
-    
+
     try:
-        # Generate response using the chat engine
+        # Pass all parameters to the generate_response method.
+        # The method now correctly returns the tuple (response, duration)
         result = await chat_engine.generate_response(
             messages=formatted_messages,
+            conversation_id=conversation_id,
             model=model,
-            temperature=temperature,
             preset=preset,
+            temperature=temperature,
+            user_id=user_id,
             rag_method=rag_method,
             retrieval_method=retrieval_method
         )
-        
+
         print(f"DEBUG: Chat engine result: {result}")
-        return result["result"], result["duration"]
+        return result
     except Exception as e:
         print(f"DEBUG: Error in chat_answer: {e}")
         raise

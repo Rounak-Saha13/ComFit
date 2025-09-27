@@ -1,3 +1,4 @@
+
 import os
 import logging
 import PyPDF2
@@ -283,7 +284,6 @@ class DocumentManager:
             txt_path = self.documents_dir / filename
             if txt_path.exists():
                 txt_path.unlink()
-                logger.info(f"Deleted document: {filename}")
             
             # Delete associated index
             index_name = txt_path.stem
@@ -291,7 +291,6 @@ class DocumentManager:
             if index_path.exists():
                 import shutil
                 shutil.rmtree(index_path)
-                logger.info(f"Deleted index: {index_name}")
             
             return True
             
@@ -300,5 +299,6 @@ class DocumentManager:
             return False
 
 # Global document manager instance
-# Point to the vector_store directory at the project root
-document_manager = DocumentManager(vector_store_dir="../vector_store") 
+document_manager = DocumentManager(vector_store_dir="../vector_store")   
+
+

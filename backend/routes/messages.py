@@ -5,6 +5,8 @@ import uuid
 import time
 import re
 from fastapi.concurrency import run_in_threadpool
+from dateutil import parser # ADDED IMPORT for flexible date parsing
+
 from schemas import Message, MessageUpdate, FeedbackRequest, TitleRequest, History, BranchItem, ChatRequest
 from chat_engine import chat_answer
 from database import supabase, supabase_auth
@@ -104,7 +106,8 @@ async def get_conversation_history(
                 strategy=msg_data.get("strategy"),
                 rag_method=msg_data.get("rag_method"),
                 retrieval_method=msg_data.get("retrieval_method"),
-                created_at=datetime.fromisoformat(msg_data["created_at"])
+                # CORRECTED LINE: use parser.isoparse()
+                created_at=parser.isoparse(msg_data["created_at"])
             )
             messages.append(msg)
         
@@ -135,6 +138,13 @@ async def get_conversation_history(
                     except (ValueError, TypeError):
                         thinking_time = 0
                 
+                # CORRECTED LINE: use parser.isoparse() for the created_at field
+                created_at_value = msg_json.get("created_at")
+                if created_at_value:
+                    created_at_dt = parser.isoparse(created_at_value)
+                else:
+                    created_at_dt = datetime.utcnow()
+
                 msg = Message(
                     id=msg_json["id"],
                     conversation_id=msg_json["conversation_id"],
@@ -151,7 +161,7 @@ async def get_conversation_history(
                     strategy=msg_json.get("strategy"),
                     rag_method=msg_json.get("rag_method"),
                     retrieval_method=msg_json.get("retrieval_method"),
-                    created_at=datetime.fromisoformat(msg_json["created_at"]) if msg_json.get("created_at") else datetime.utcnow()
+                    created_at=created_at_dt
                 )
                 branch_messages.append(msg)
             
@@ -408,9 +418,9 @@ async def generate_title(
     user_id: Optional[str] = Depends(get_current_user)
 ):
     prompt = (
-         f'Generate a concise chat title using EXACTLY 2-4 words.\n'
-         f'User asked: "{req.user_message}"\n'
-         f'AI: "{req.ai_response}"'
+          f'Generate a concise chat title using EXACTLY 2-4 words.\n'
+          f'User asked: "{req.user_message}"\n'
+          f'AI: "{req.ai_response}"'
     )
 
     MODEL_NAME = "qwen3:0.6b"
