@@ -1,3 +1,5 @@
+# In backend/chat_engine/client.py
+
 import os
 import sys
 import time
@@ -7,11 +9,8 @@ import logging
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
-# --- NEW IMPORTS FOR SUPABASE ---
-from supabase import create_client, Client
 
-
-# Import core pieces from your Hybrid_Bot module
+# Import core pieces from your Hybrid_Bot module (Corrected Import List)
 from .Hybrid_Bot import (
     process_model_context_query,
     RACCorrector,
@@ -25,12 +24,10 @@ from .Hybrid_Bot import (
     validate_google_api_keys_from_env,
     load_documents_for_indexing,
     _extract_source_filenames,
-    # Assuming Hybrid_Bot also imports/defines SupabaseImageTool
-    SupabaseImageTool # Assuming you expose this in Hybrid_Bot
 )
 
 
-from .document_manager import document_manager
+from .document_manager import document_manager # Assuming this is a local module
 
 
 # -----------------------
@@ -80,6 +77,7 @@ DEFAULT_RAG_STRATEGY = "multi_step_query_engine"
 DEFAULT_RETRIEVAL = "hybrid"
 
 
+
 # -----------------------
 # Chat Engine
 # -----------------------
@@ -102,14 +100,14 @@ class ChatEngine:
         self.rac_corrector = None
         self.agent = None
         self.tools_for_agent: List[FunctionTool] = []
-        # NEW: Supabase Image Tool Instance
-        self.supabase_image_tool = None
 
 
         # Determine testing mode from command line arguments
         self.testing_mode_enabled = "--dry-run" in sys.argv
         if self.testing_mode_enabled:
-            sys.argv.remove("--dry-run")
+            # Need to check if the argument is actually in sys.argv before removing
+            if "--dry-run" in sys.argv:
+                sys.argv.remove("--dry-run")
 
 
         # LlamaIndex global settings
@@ -154,22 +152,9 @@ class ChatEngine:
             )
             self.rac_corrector.testing_mode = self.testing_mode_enabled
             logger.info("RAC Corrector initialized.")
-            
-            # 4) Supabase Image Tool Initialization
-            SUPABASE_URL = os.getenv("SUPABASE_URL")
-            SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-            if not (SUPABASE_URL and SUPABASE_ANON_KEY):
-                logger.error("Supabase keys not configured for image tool.")
-            else:
-                # Assuming SupabaseImageTool is imported from Hybrid_Bot
-                self.supabase_image_tool = SupabaseImageTool(
-                    supabase_url=SUPABASE_URL,
-                    supabase_key=SUPABASE_ANON_KEY
-                )
-                logger.info("Supabase Image Tool initialized.")
 
 
-            # 5) Tools for agent
+            # 4) Tools for agent
             # Wrap local query to be resilient
             def _local_book_qa_function(q: str) -> str:
                 try:
@@ -201,7 +186,7 @@ class ChatEngine:
             self.tools_for_agent = [local_rag_tool, google_search_tool_for_agent]
 
 
-            # 6) Main ReAct Agent
+            # 5) Main ReAct Agent
             self.agent = ReActAgent.from_tools(
                 llm=Settings.llm,
                 tools=self.tools_for_agent,
@@ -224,10 +209,10 @@ class ChatEngine:
         user_id: str,
         rag_method: str,
         retrieval_method: str,
-    ) -> tuple[str, int]:
+        # MODIFIED: New return signature
+    ) -> tuple[str, int, Optional[str]]: 
         """
-        Orchestrates the RAG/Image pipeline and returns (response_text, duration_ms).
-        The final response_text is a formatted string containing the answer, images, and sources.
+        Orchestrates the RAG pipeline and returns (response_text, duration_ms, image_file_path).
         """
         logger.info(f"Received request for conversation_id: {conversation_id}")
         logger.info(f"User ID: {user_id}")
@@ -236,7 +221,7 @@ class ChatEngine:
         # Extract the latest user message
         user_query = messages[-1].get("content", "") if messages else ""
         if not user_query or not user_query.strip():
-            return "Error: User query is empty.", 0
+            return "Error: User query is empty.", 0, None # MODIFIED: Return None
 
 
         # Normalize strategy/retrieval labels -> canonical keys expected by core
@@ -245,13 +230,16 @@ class ChatEngine:
 
 
         start_time = time.time()
+        
+        # Initialize the new variable
+        final_image_file_path = None 
+        
         try:
-            # CRITICAL CALL: Pass the Supabase Image Tool to the processing function
             mcp_response = await process_model_context_query(
                 query=user_query,
                 context_memory=messages,
-                tool_outputs=[],  
-                scratchpad="",    
+                tool_outputs=[],
+                scratchpad="",
                 agent_instance=self.agent,
                 rac_corrector_instance=self.rac_corrector,
                 testing_mode=self.testing_mode_enabled,
@@ -261,42 +249,59 @@ class ChatEngine:
                 selected_retrieval_method=retrieval_key,
                 local_query_engine=self.local_query_engine,
                 google_custom_search_instance=self.google_search_instance,
-                tools_for_agent=self.tools_for_agent,
-                # NEW PARAMETER: MUST BE ACCEPTED BY Hybrid_Bot.process_model_context_query
-                supabase_image_tool=self.supabase_image_tool 
+                tools_for_agent=self.tools_for_agent
             )
 
 
             final_answer = mcp_response.get("final_answer", "No answer generated.")
-            
-            # --- Image Handling ---
-            image_links = mcp_response.get("image_links", [])
-            image_display_text = ""
+            # --- NEW: Capture image_file_path from mcp_response ---
+            final_image_file_path = mcp_response.get("image_file_path", None)
+            # --------------------------------------------------------
 
-            if image_links:
-                # Format image data into a string for the response payload
-                image_display_text += "\n\n🖼️ **RETRIEVED IMAGES:**\n"
-                for i, link in enumerate(image_links, 1):
-                    image_display_text += f"    - Title: {link.get('prompt', 'Image')}\n"
-                    image_display_text += f"    - URL: {link.get('public_url', 'URL N/A')}\n"
-            # --- End Image Handling ---
+
+            # If the core complained about an invalid strategy (legacy UI strings, etc.),
+            # retry once with safe defaults to avoid user-facing suppression.
+            if final_answer.startswith("Invalid RAG strategy selected"):
+                logger.warning("Invalid RAG strategy from upstream. Retrying with safe defaults (multi_step_query_engine, hybrid).")
+
+
+                mcp_response = await process_model_context_query(
+                    query=user_query,
+                    context_memory=messages,
+                    tool_outputs=[],
+                    scratchpad="",
+                    agent_instance=self.agent,
+                    rac_corrector_instance=self.rac_corrector,
+                    testing_mode=self.testing_mode_enabled,
+                    suppress_threshold=0.4,
+                    flag_threshold=0.6,
+                    selected_rag_strategy=DEFAULT_RAG_STRATEGY,
+                    selected_retrieval_method=DEFAULT_RETRIEVAL,
+                    local_query_engine=self.local_query_engine,
+                    google_custom_search_instance=self.google_search_instance,
+                    tools_for_agent=self.tools_for_agent
+                )
+                final_answer = mcp_response.get("final_answer", "No answer generated.")
+                # --- NEW: Capture image_file_path from mcp_response after retry ---
+                final_image_file_path = mcp_response.get("image_file_path", None)
+                # -----------------------------------------------------------------
+
 
             sources_info = mcp_response.get("sources_used", {})
             sources_str = self.format_sources_info(sources_info)
-            
-            # Concatenate the final answer, image information, and sources.
-            formatted_response = f"{final_answer}{image_display_text}\n\n{sources_str}"
+            formatted_response = f"{final_answer}\n\n{sources_str}"
+
 
             duration = int((time.time() - start_time) * 1000)
-            return formatted_response, duration
+            # MODIFIED: Return the image_file_path
+            return formatted_response, duration, final_image_file_path 
 
 
         except Exception as e:
             logger.error(f"Error in ChatEngine.generate_response: {e}", exc_info=True)
             duration = int((time.time() - start_time) * 1000)
-            # Simplified error message for the user, while logging the full trace
-            user_error_msg = f"Error: An unexpected error occurred while processing your request. Please check the backend logs."
-            return user_error_msg, duration
+            # MODIFIED: Return None on error
+            return f"Error: An unexpected error occurred while processing your request. Details: {str(e)}", duration, None
 
 
     def format_sources_info(self, sources_info: Dict[str, Any]) -> str:
@@ -307,21 +312,21 @@ class ChatEngine:
 
 
         if local_files:
-            info_lines.append("  📄 **Local PDF Documents/Images Referenced:**")
+            info_lines.append("  📄 **Local PDF Documents Referenced:**")
             for i, filename in enumerate(local_files, 1):
-                info_lines.append(f"    {i}. {filename}")
+                info_lines.append(f"    {i}. {filename}")
 
 
         if web_links:
-            info_lines.append("  🌐 **Web Sources Referenced:**")
+            info_lines.append("  🌐 **Web Sources Referenced:**")
             for i, link in enumerate(web_links, 1):
                 title = link.get('title', 'Unknown Title')
                 url = link.get('url', '')
-                info_lines.append(f"    {i}. {title} ({url})")
+                info_lines.append(f"    {i}. {title} ({url})")
 
 
         if not local_files and not web_links:
-            info_lines.append("  ℹ️ No external sources were consulted.")
+            info_lines.append("  ℹ️ No external sources were consulted.")
 
 
         return "\n".join(info_lines)
@@ -354,13 +359,13 @@ if __name__ == "__main__":
                 "preset": "default",
                 "temperature": 0.7,
                 "user_id": "test_user_id",
-                "rag_method": "No Specific RAG Method",    # UI label; normalization will fix this
-                "retrieval_method": "local context only",  # UI label; normalization will fix this
+                "rag_method": "No Specific RAG Method", # UI label; normalization will fix this
+                "retrieval_method": "local context only", # UI label; normalization will fix this
             }
 
 
             start_time = time.time()
-            response_text, _duration_ms = await engine.generate_response(**mock_request_params)
+            response_text, _duration_ms, image_path = await engine.generate_response(**mock_request_params)
             end_time = time.time()
 
 
@@ -368,6 +373,10 @@ if __name__ == "__main__":
             print(f"Final Answer (Time: {end_time - start_time:.2f}s):")
             print("=" * 50)
             print(response_text)
+            
+            if image_path:
+                print(f"\n🖼️ **Image Result:** Image Path Detected: {image_path}") # CLI won't show the image, but confirms the logic
+                print("--------------------------------------------------")
 
 
-    asyncio.run(main_cli())
+        asyncio.run(main_cli())

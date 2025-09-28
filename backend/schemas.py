@@ -28,6 +28,8 @@ class MessageBase(BaseModel):
     conversation_id: str
     sender: str
     content: str
+    # --- NEW IMAGE FIELD ADDED TO BASE MODEL ---
+    image_url: Optional[str] = Field(None, alias="imageUrl")
 
 class MessageCreate(MessageBase):
     id: str
@@ -71,6 +73,8 @@ class MessageUpdate(BaseModel):
     top_p: Optional[float] = None
     rag_method: Optional[str] = None
     retrieval_method: Optional[str] = None
+    # --- NEW IMAGE FIELD ADDED TO UPDATE MODEL ---
+    image_url: Optional[str] = Field(None, alias="imageUrl")
 
     model_config = ConfigDict(validate_by_name=True)
 
