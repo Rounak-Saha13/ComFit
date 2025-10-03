@@ -1,5 +1,3 @@
-# In backend/routes/messages.py
-
 from fastapi import APIRouter, HTTPException, Depends, Header, Body
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -7,36 +5,13 @@ import uuid
 import time
 import re
 from fastapi.concurrency import run_in_threadpool
-from dateutil import parser 
-from pydantic import ValidationError 
+from dateutil import parser # ADDED IMPORT for flexible date parsing
 
-# --- FIXED IMPORTS ---
-# Using absolute imports based on project structure (schemas, database, chat_engine are top-level packages in 'backend')
-from schemas import Message, MessageUpdate, FeedbackRequest, TitleRequest, History, BranchItem, ChatRequest, MessageCreate
-from database import supabase, supabase_auth # Assuming database module exists
-from chat_engine.client import ChatEngine
-# ---------------------
+from schemas import Message, MessageUpdate, FeedbackRequest, TitleRequest, History, BranchItem, ChatRequest
+from chat_engine import chat_answer
+from database import supabase, supabase_auth
 
 router = APIRouter()
-
-# Global constants for the Supabase Storage bucket and sender names
-SUPABASE_IMAGE_BUCKET = 'comfit_images' 
-AI_SENDER = "ai" 
-USER_SENDER = "user"
-
-# --- GLOBAL CHAT ENGINE INSTANCE ---
-# This block attempts to initialize the ChatEngine for immediate use by the routes.
-try:
-    # Instantiate the ChatEngine here to make it callable globally
-    chat_engine_instance = ChatEngine() 
-except Exception as e:
-    print(f"WARNING: Could not initialize ChatEngine instance in messages.py. All /chat routes will fail: {e}")
-    # Define a mock class for graceful failure if initialization fails
-    class MockChatEngine:
-        async def generate_response(self, *args, **kwargs):
-            return "Error: Chat Engine not initialized due to previous error.", 0, None
-    chat_engine_instance = MockChatEngine()
-
 
 async def get_current_user(authorization: Optional[str] = Header(None)):
     """Extract user ID from authorization header"""
@@ -51,124 +26,6 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# -------------------------------------------------------------
-# --- NEW: CHAT ENDPOINT FOR SUBMITTING NEW MESSAGES ---
-# -------------------------------------------------------------
-@router.post("/chat")
-async def handle_new_chat(
-    payload: ChatRequest = Body(...), 
-    user_id: Optional[str] = Depends(get_current_user)
-):
-    """
-    Handles user input, calls the ChatEngine, gets the AI response (and potential image path),
-    saves the transaction, and returns the AI's response.
-    """
-    if not supabase:
-         raise HTTPException(status_code=500, detail="Database client not initialized.")
-         
-    conversation_id = payload.conversation_id
-    
-    # Extract the latest user message content from the messages list
-    user_message_content = payload.messages[-1].content if payload.messages else "" 
-    
-    # 1. Insert User Message
-    try:
-        # Insert the full message data provided by the frontend
-        user_msg_data = {
-            **payload.messages[-1].model_dump(by_alias=True, exclude_none=True),
-            "conversation_id": conversation_id,
-            "sender": USER_SENDER,
-            "created_at": datetime.utcnow().isoformat(),
-            "user_id": user_id
-        }
-        supabase.table("messages").insert([user_msg_data]).execute()
-    except Exception as e:
-        print(f"Error inserting user message: {e}")
-        
-    # 2. Call Chat Engine (CRITICAL FIX APPLIED HERE)
-    try:
-        # Create a minimal context for the bot (latest user message)
-        messages_context = [{"content": user_message_content, "sender": USER_SENDER}] 
-        
-        # FIX: Ensure 3 values are unpacked to avoid the "too many values to unpack" error
-        ai_content, duration, image_file_path = await chat_engine_instance.generate_response(
-            messages=messages_context,
-            conversation_id=conversation_id,
-            model=payload.model,
-            preset=payload.preset,
-            temperature=payload.temperature,
-            user_id=user_id,
-            rag_method=payload.rag_method,
-            retrieval_method=payload.retrieval_method
-        )
-        
-        if ai_content.startswith("Error:") or ai_content.startswith("❌"):
-             raise HTTPException(status_code=400, detail=ai_content)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Chat Engine Error: {e}")
-        raise HTTPException(status_code=500, detail=f"AI model error: {str(e)}")
-
-    # 3. Get Public URL from Supabase Storage (if image path is present)
-    ai_image_url = None
-    if image_file_path:
-        try:
-            # Synchronous call to Supabase storage must be run in a threadpool
-            def get_url_sync():
-                return supabase.storage.from_(SUPABASE_IMAGE_BUCKET).get_public_url(image_file_path)
-
-            public_url_data = await run_in_threadpool(get_url_sync)
-            
-            if isinstance(public_url_data, str) and public_url_data.startswith("http"):
-                ai_image_url = public_url_data
-                print(f"DEBUG: Generated Public URL for {image_file_path}: {ai_image_url}")
-            else:
-                print(f"DEBUG: Supabase returned unexpected data for URL generation: {public_url_data}")
-
-        except Exception as e:
-            print(f"Error generating public URL from Supabase Storage: {e}")
-            ai_image_url = None 
-
-    # 4. Insert AI Message with the Image URL
-    ai_message_id = str(uuid.uuid4())
-    try:
-        ai_message_data = {
-            "id": ai_message_id,
-            "conversation_id": conversation_id,
-            "sender": AI_SENDER,
-            "content": ai_content,
-            "image_url": ai_image_url, # <-- THE NEW DATA POINT
-            "created_at": datetime.utcnow().isoformat(),
-            "user_id": user_id,
-            "thinkingTime": duration, # Mapped to Pydantic 'thinkingTime' alias
-            "model": payload.model,
-            "preset": payload.preset,
-            "temperature": payload.temperature,
-            "top_p": payload.top_p,
-            "strategy": payload.strategy,
-            "rag_method": payload.rag_method,
-            "retrieval_method": payload.retrieval_method,
-        }
-        
-        # Insert into database
-        supabase.table("messages").insert([ai_message_data]).execute()
-        
-        # Return the AI message data back to the frontend, validated by Pydantic
-        return Message(**ai_message_data)
-
-    except ValidationError as e:
-        print(f"Pydantic Validation Error on AI Response: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal Validation Error on AI Response: {str(e)}")
-    except Exception as e:
-        print(f"Error inserting AI message: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save AI response: {str(e)}")
-
-
-# -------------------------------------------------------------
-# --- MODIFIED: HISTORY ENDPOINT TO INCLUDE image_url ---
-# -------------------------------------------------------------
 @router.get("/messages/conversation/{conversation_id}/history")
 async def get_conversation_history(
     conversation_id: str,
@@ -190,7 +47,7 @@ async def get_conversation_history(
         
         # Get all messages for this conversation (main conversation flow)
         messages_result = supabase.table("messages")\
-            .select("id, conversation_id, sender, content, thinking_time, feedback, model, preset, system_prompt, speculative_decoding, temperature, top_p, strategy, rag_method, retrieval_method, created_at, image_url")\
+            .select("id, conversation_id, sender, content, thinking_time, feedback, model, preset, system_prompt, speculative_decoding, temperature, top_p, strategy, rag_method, retrieval_method, created_at")\
             .eq("conversation_id", conversation_id)\
             .order("created_at", desc=False)\
             .execute()
@@ -233,13 +90,12 @@ async def get_conversation_history(
                 except (ValueError, TypeError):
                     thinking_time = 0
             
-            # Create Message object using data from the database
             msg = Message(
                 id=msg_data["id"],
                 conversation_id=msg_data["conversation_id"],
                 sender=msg_data["sender"],
                 content=msg_data["content"],
-                thinkingTime=thinking_time, # Mapped from DB 'thinking_time' to Pydantic 'thinkingTime' alias
+                thinking_time=thinking_time,
                 feedback=msg_data.get("feedback"),
                 model=msg_data.get("model"),
                 preset=msg_data.get("preset"),
@@ -250,9 +106,7 @@ async def get_conversation_history(
                 strategy=msg_data.get("strategy"),
                 rag_method=msg_data.get("rag_method"),
                 retrieval_method=msg_data.get("retrieval_method"),
-                # --- NEW MAPPING ---
-                imageUrl=msg_data.get("image_url"), # Mapped from DB 'image_url' to Pydantic 'imageUrl' alias
-                # -------------------
+                # CORRECTED LINE: use parser.isoparse()
                 created_at=parser.isoparse(msg_data["created_at"])
             )
             messages.append(msg)
@@ -296,7 +150,7 @@ async def get_conversation_history(
                     conversation_id=msg_json["conversation_id"],
                     sender=msg_json["sender"],
                     content=msg_json["content"],
-                    thinkingTime=thinking_time, # Mapped to Pydantic 'thinkingTime' alias
+                    thinking_time=thinking_time,
                     feedback=msg_json.get("feedback"),
                     model=msg_json.get("model"),
                     preset=msg_json.get("preset"),
@@ -307,9 +161,6 @@ async def get_conversation_history(
                     strategy=msg_json.get("strategy"),
                     rag_method=msg_json.get("rag_method"),
                     retrieval_method=msg_json.get("retrieval_method"),
-                    # --- NEW MAPPING ---
-                    imageUrl=msg_json.get("image_url"), # Mapped to Pydantic 'imageUrl' alias
-                    # -------------------
                     created_at=created_at_dt
                 )
                 branch_messages.append(msg)
@@ -319,8 +170,8 @@ async def get_conversation_history(
                 branches_by_edit_id[edit_at_id] = []
             
             branch_item = BranchItem(
-                branchId=branch_id if not is_original else None,
-                isOriginal=is_original,
+                branch_id=branch_id if not is_original else None,
+                is_original=is_original,
                 messages=branch_messages
             )
             
@@ -337,6 +188,7 @@ async def get_conversation_history(
                 active_branch_id = branch_id
         
         # Always set original_messages to the main conversation messages
+        # This represents the original conversation flow before any branching
         original_messages = messages.copy()
         
         print(f"DEBUG: Final structure - messages: {len(messages)}, original: {len(original_messages)}, branches: {len(branches_by_edit_id)}")
@@ -365,7 +217,6 @@ async def update_message_feedback(
     user_id: str = Depends(get_current_user)
 ):
     """Update feedback for a message"""
-    # ... (existing update_message_feedback function) ...
     try:
         # Verify message ownership through conversation
         msg_result = supabase.table("messages")\
@@ -412,7 +263,6 @@ async def regenerate_message(
     user_id: Optional[str] = Depends(get_current_user)
 ):
     """Regenerate an AI message - stateless, returns fresh content only"""
-    # ... (existing regenerate_message function) ...
     try:
         # Verify message ownership through conversation
         print(f"DEBUG: Looking for message with ID: {message_id}")
@@ -503,15 +353,15 @@ async def regenerate_message(
         
         if last_user_message:
             formatted_messages.append({
-                "content": last_user_message["content"],
-                "sender": "user" # Use 'sender' to conform to internal bot usage context
+                "role": "user",
+                "content": last_user_message["content"]
             })
         
         # Add system prompt if provided
         if payload.system_prompt:
             formatted_messages.insert(0, {
-                "content": payload.system_prompt,
-                "sender": "system"
+                "role": "system",
+                "content": payload.system_prompt
             })
         
         print(f"DEBUG: Sending to chat engine: {formatted_messages}")
@@ -519,8 +369,7 @@ async def regenerate_message(
         # Generate new response using chat engine
         start_time = time.time()
         try:
-            # We call generate_response but discard the image_file_path (as it's stateless regen)
-            ai_content, duration, _ = await chat_engine_instance.generate_response(
+            ai_content, duration = await chat_answer(
                 messages=formatted_messages,
                 conversation_id=conv_id,
                 model=payload.model,
@@ -531,7 +380,7 @@ async def regenerate_message(
                 retrieval_method=payload.retrieval_method
             )
             
-            if isinstance(ai_content, str) and (ai_content.startswith("Error:") or ai_content.startswith("❌")):
+            if isinstance(ai_content, str) and ai_content.startswith("Error:"):
                 raise HTTPException(status_code=400, detail=ai_content)
                 
         except Exception as e:
@@ -568,27 +417,25 @@ async def generate_title(
     req: TitleRequest,
     user_id: Optional[str] = Depends(get_current_user)
 ):
-    """Generates a concise title for a conversation."""
-    # ... (existing generate_title function) ...
     prompt = (
-        f'Generate a concise chat title using EXACTLY 2-4 words.\n'
-        f'User asked: "{req.user_message}"\n'
-        f'AI: "{req.ai_response}"'
+          f'Generate a concise chat title using EXACTLY 2-4 words.\n'
+          f'User asked: "{req.user_message}"\n'
+          f'AI: "{req.ai_response}"'
     )
 
     MODEL_NAME = "qwen3:0.6b"
     PRESET = "CFIR"
     TEMP = 0.7
 
-    # Generate title using the chat engine. We discard duration and image_file_path
-    title_html, _, _ = await chat_engine_instance.generate_response(
-        messages=[{"content": prompt, "sender": USER_SENDER}],
+    # Generate title using the chat engine
+    title_html, _ = await chat_answer(
+        messages=[{"role": "user", "content": prompt}],
         conversation_id=req.conversation_id,
         model=MODEL_NAME,
         preset=PRESET,
         temperature=TEMP,
         user_id=user_id,
-        rag_method="no-workflow", 
+        rag_method="no-workflow",  # Use default strategy for title generation
         retrieval_method="local context only"
     )
 

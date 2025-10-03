@@ -1,4 +1,3 @@
-# In backend/chat_engine/Hybrid_Bot.py
 
 import os
 import logging
@@ -8,7 +7,7 @@ import re
 import json
 import requests
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Tuple, Optional # Explicitly import Optional
+from typing import List, Dict, Any, Tuple, Optional
 import nltk
 from nltk.tokenize import sent_tokenize
 import hashlib
@@ -89,6 +88,10 @@ OPTIMAL_LLM = Ollama(model=OPTIMAL_LLM_MODEL_NAME, request_timeout=600.0)
 Settings.embed_model = OllamaEmbedding(model_name="nomic-embed-text")
 Settings.llm = OPTIMAL_LLM
 
+# --- Image Integration Global Setting (NEW ADDITION) ---
+SUPABASE_URL = "https://tyswhhteurchuzkngqja.supabase.co/storage/v1/object/public/comfit_images/"
+
+
 # --- Helper to extract source filenames from LlamaIndex Response object ---
 def _extract_source_filenames(response_obj: Response) -> List[str]:
     """Extracts unique filenames from the source nodes of a LlamaIndex Response object."""
@@ -102,22 +105,6 @@ def _extract_source_filenames(response_obj: Response) -> List[str]:
         if filename:
             unique_filenames.add(filename)
     return sorted(list(unique_filenames))
-
-# --- NEW HELPER: Image Detection Logic ---
-def _detect_image_request(query: str) -> Optional[str]:
-    """
-    Simple logic to detect if the user wants an image generated.
-    Returns the specific file path/name in the Supabase bucket if detected.
-    """
-    normalized_query = query.lower()
-    
-    # --- TEMPORARY MOCK LOGIC: Trigger on keywords ---
-    if "generate image" in normalized_query or "show me a laser scan" in normalized_query or ("image" in normalized_query and "3d" in normalized_query):
-        # NOTE: Use one of your actual uploaded file names here
-        return '3DLaserScanner_P18_img1.png'
-        
-    return None
-# --- END NEW HELPER ---
 
 # --- RAC (Retrieval-Augmented Correction) Implementation ---
 class FactualClaimExtractor:
@@ -224,14 +211,15 @@ class FactVerifier:
                 local_evidence_found = False
                 for query in queries_to_try:
                     try:
-                        local_result = self.local_query_engine.query(query) # This returns a Response object
+                        # local_query_engine.query returns a Response object
+                        local_result = self.local_query_engine.query(query) 
                         local_content = str(local_result).strip()
                         extracted_files = _extract_source_filenames(local_result)
                         
                         if (local_content and len(local_content) > 20 and
                                 not any(phrase in local_content.lower() for phrase in [
-                                    "i don't know", "no information", "not mentioned",
-                                    "cannot find", "not available", "no details"])):
+                                        "i don't know", "no information", "not mentioned",
+                                        "cannot find", "not available", "no details"])):
                             evidence.append({
                                 'source': 'local_knowledge',
                                 'content': local_content,
@@ -267,8 +255,6 @@ class FactVerifier:
                     })
                     web_sources.extend(web_links_from_search) # Store the structured web source links
                     logger.info(f"Web evidence found for query: {search_query}")
-                else:
-                    logger.info("No relevant web evidence found.")
             except Exception as e:
                 logger.warning(f"Web verification failed: {e}")
         
@@ -785,6 +771,7 @@ async def run_planning_workflow(query: str, agent_instance: ReActAgent, trace: L
     trace.append(f"Strategy: Planning Workflow - Agent thinking on '{query}'...")
     try:
         # Agent.chat() returns an AgentChatResponse which has a 'response' attribute
+        # Note: The agent's response text will include the JSON string from local_book_qa_function
         response_obj = await asyncio.to_thread(agent_instance.chat, query)
         response = response_obj.response
         trace.append(f"Planning Workflow Raw Response: {response}")
@@ -794,21 +781,12 @@ async def run_planning_workflow(query: str, agent_instance: ReActAgent, trace: L
         logger.error(f"Error running planning workflow: {e}", exc_info=True)
         return "An error occurred during the planning workflow."
 
-async def run_multi_step_query_engine_workflow(query: str, local_query_engine: Any, google_custom_search_instance: Any, trace: List[str], tools_for_agent: List[FunctionTool]) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+async def run_multi_step_query_engine_workflow(query: str, local_query_engine: Any, google_custom_search_instance: Any, trace: List[str], tools_for_agent: List[FunctionTool]) -> Tuple[str, List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
     """
     Executes a query using a RouterQueryEngine, which selects between local and web query engines.
-    Returns the response text, any web links collected, and local source filenames.
+    Returns the response text, any web links collected, local source filenames, and image links.
     """
     trace.append(f"Strategy: Multi-Step Query Engine - Routing '{query}'...")
-    
-    # Create QueryEngineTool for local data
-    local_tool_choice = QueryEngineTool.from_defaults(
-        query_engine=local_query_engine,
-        description=(
-            "Useful for questions specifically about the content of the provided PDF book. "
-            "Use when the question relates to 'speed process', 'anthropometry', 'product fit', 'sizing', etc."
-        ),
-    )
     
     # Custom Google Query Engine that synthesizes results and returns links
     class GoogleQueryEngine:
@@ -847,9 +825,23 @@ async def run_multi_step_query_engine_workflow(query: str, local_query_engine: A
     google_qe_instance = GoogleQueryEngine(google_custom_search_instance, OPTIMAL_LLM)
     
     query_engine_tools = []
-    # Add tools based on what's available in `tools_for_agent` (which reflects retrieval method selection)
-    if any(tool.metadata.name == "local_book_qa" for tool in tools_for_agent):
+    local_tool_used = False
+
+    # Check for local tool presence (it will be of type FunctionTool if passed in tools_for_agent)
+    local_tool_in_agent = next((tool for tool in tools_for_agent if tool.metadata.name == "local_book_qa"), None)
+
+    if local_tool_in_agent:
+        local_tool_used = True
+        # NOTE: For RouterQueryEngine, we must use the raw QueryEngine (not the FunctionTool)
+        local_tool_choice = QueryEngineTool.from_defaults(
+            query_engine=local_query_engine,
+            description=(
+                "Useful for questions specifically about the content of the provided PDF book. "
+                "Use when the question relates to 'speed process', 'anthropometry', 'product fit', 'sizing', etc."
+            ),
+        )
         query_engine_tools.append(local_tool_choice)
+
     if any(tool.metadata.name == "google_web_search" for tool in tools_for_agent):
         query_engine_tools.append(
             QueryEngineTool.from_defaults(
@@ -859,7 +851,7 @@ async def run_multi_step_query_engine_workflow(query: str, local_query_engine: A
         )
 
     if not query_engine_tools:
-        return "No relevant query engine available for the selected retrieval method.", [], []
+        return "No relevant query engine available for the selected retrieval method.", [], [], []
 
     # Initialize RouterQueryEngine to select the best tool
     router_query_engine = RouterQueryEngine(
@@ -874,22 +866,41 @@ async def run_multi_step_query_engine_workflow(query: str, local_query_engine: A
         web_links_collected = response_obj.metadata.get("links", []) # Extract links from metadata for web search
         local_files_collected = _extract_source_filenames(response_obj) # Extract filenames for local search
         
+        # --- NEW IMAGE LOGIC FOR Multi-Step Query Engine ---
+        image_links_collected = []
+        if local_tool_used: # Check if the local query engine was potentially selected
+            # Since the router selects a QueryEngine which returns a Response, we can directly inspect the nodes
+            # Note: response_obj.source_nodes will only be populated if the Router selected the local_tool_choice.
+            nodes = response_obj.source_nodes or []
+            for node in nodes:
+                name = node.metadata.get("name")
+                caption = node.metadata.get("caption")
+                page = node.metadata.get("page")
+                if name:
+                    image_links_collected.append({
+                        "url": SUPABASE_URL + name,
+                        "caption": caption,
+                        "page": page,
+                        "source_file": node.metadata.get('filename') # Add source filename for traceability
+                    })
+
         trace.append(f"Multi-Step Query Engine Raw Response: {response_text}")
-        return response_text, web_links_collected, local_files_collected
+        return response_text, web_links_collected, local_files_collected, image_links_collected
     except Exception as e:
         trace.append(f"Error in Multi-Step Query Engine Workflow: {e}")
         logger.error(f"Error running multi_step_query_engine_workflow: {e}", exc_info=True)
-        return "An error occurred during the multi-step query engine workflow.", [], []
+        return "An error occurred during the multi-step query engine workflow.", [], [], []
 
 async def run_multi_strategy_workflow(query: str, local_query_engine: Any, google_custom_search_instance: Any, trace: List[str], tools_for_agent: List[FunctionTool]) -> Dict[str, Any]:
     """
     Executes both local RAG and web search queries, then synthesizes a combined answer.
-    Returns the synthesized response and all collected web links.
+    Returns the synthesized response and all collected web links, local files, and images.
     """
     trace.append(f"Strategy: Multi-Strategy Workflow - Executing multiple queries for '{query}'...")
     responses = []
     all_links_from_web_search = [] # To collect links specifically from web searches
     all_local_files = [] # To collect local filenames from local RAG
+    all_image_links = [] # To collect image links
     
     # Determine which sources are enabled by the provided tools
     use_local_source = any(tool.metadata.name == "local_book_qa" for tool in tools_for_agent)
@@ -897,12 +908,18 @@ async def run_multi_strategy_workflow(query: str, local_query_engine: Any, googl
     
     if use_local_source:
         try:
-            local_response_obj = await asyncio.to_thread(local_query_engine.query, query)
-            local_response_text = str(local_response_obj)
-            extracted_files = _extract_source_filenames(local_response_obj)
-            
+            # Use the local_book_qa_function to get the structured result
+            local_response_dict_str = local_book_qa_function(query) 
+            local_response_dict = json.loads(local_response_dict_str)
+
+            local_response_text = local_response_dict['text']
+            extracted_files = local_response_dict['local_files']
+            images = local_response_dict['images']
+
             responses.append(f"Local RAG result: {local_response_text}")
             all_local_files.extend(extracted_files)
+            all_image_links.extend(images) # Collect images
+            
             trace.append(f"Multi-Strategy: Local RAG executed. Response snippet: {local_response_text[:100]}...")
             if extracted_files:
                 trace.append(f"Multi-Strategy: Local RAG sources: {', '.join(extracted_files)}")
@@ -953,7 +970,7 @@ async def run_multi_strategy_workflow(query: str, local_query_engine: Any, googl
     
     combined_info = "\n\n".join(responses)
     if not combined_info.strip():
-        return {"response": "No information found from any strategy.", "links": [], "local_files": []}
+        return {"response": "No information found from any strategy.", "links": [], "local_files": [], "images": []}
     
     # Synthesize a final answer from all collected information
     synthesis_prompt = f"""
@@ -970,13 +987,13 @@ async def run_multi_strategy_workflow(query: str, local_query_engine: Any, googl
         final_answer = await asyncio.to_thread(OPTIMAL_LLM.complete, synthesis_prompt)
         final_answer = str(final_answer)
         trace.append(f"Multi-Strategy Synthesis Complete. Final Answer snippet: {final_answer[:100]}...")
-        return {"response": final_answer, "links": all_links_from_web_search, "local_files": all_local_files}
+        return {"response": final_answer, "links": all_links_from_web_search, "local_files": all_local_files, "images": all_image_links}
     except Exception as e:
         trace.append(f"Error in Multi-Strategy Synthesis: {e}")
         logger.error(f"Error in multi-strategy synthesis: {e}", exc_info=True)
-        return {"response": "An error occurred during multi-strategy synthesis.", "links": [], "local_files": []}
+        return {"response": "An error occurred during multi-strategy synthesis.", "links": [], "local_files": [], "images": []}
 
-# --- Model Context Protocol Processing Function (UPDATED) ---
+# --- Model Context Protocol Processing Function ---
 async def process_model_context_query(
     query: str,
     context_memory: Dict[str, Any],
@@ -994,8 +1011,12 @@ async def process_model_context_query(
     tools_for_agent: List[FunctionTool]
 ) -> Dict[str, Any]:
     """
-    Orchestrates the entire response generation pipeline.
-    MODIFIED: Now includes image detection and returns 'image_file_path'.
+    Orchestrates the entire response generation pipeline, including:
+    - Preprocessing the query
+    - Executing the selected RAG strategy (Planning, Multi-Step, Multi-Strategy, No Method)
+    - Applying Retrieval-Augmented Correction (RAC)
+    - Handling confidence-based suppression/flagging
+    - Collecting and formatting source information
     """
     logger.info(f"Processing Model Context Query: '{query}' with strategy: {selected_rag_strategy}, retrieval: {selected_retrieval_method}")
     response_trace = [f"ModelContextQuery received: Query='{query}'"]
@@ -1007,7 +1028,8 @@ async def process_model_context_query(
         'local_sources': [], # Tracks detailed info about local queries
         'web_sources': [],   # Tracks queries made to web search
         'web_links_used': [], # Stores actual URL details from web searches
-        'local_files_used': [] # Stores unique filenames from local documents
+        'local_files_used': [], # Stores unique filenames from local documents
+        'image_links': [] # Stores image metadata
     }
 
     start_total_process_mcp = time.perf_counter()
@@ -1023,32 +1045,51 @@ async def process_model_context_query(
         start_rag_strategy = time.perf_counter()
         original_response_text = ""
         # These are reset per query as they represent the context for *this* specific interaction
-        tool_outputs = [] 
+        tool_outputs = []  
         scratchpad = ""
         
-        # Enhanced tool wrappers to capture source usage
-        class SourceTrackingLocalBookQA:
-            def __init__(self, query_engine):
-                self.query_engine = query_engine
-            
-            def __call__(self, query: str) -> str:
-                logger.info(f"Local RAG: Querying for '{query}'")
-                response_obj = self.query_engine.query(query) # Get Response object
-                local_response_text = str(response_obj)
-                extracted_files = _extract_source_filenames(response_obj)
+        # Enhanced tool wrappers to capture source usage and parse complex tool output (text + images/files)
+        # Note: We need a wrapper only if the RAG strategy is 'planning_workflow' or 'no_method'
+        # For 'multi_step' and 'multi_strategy', the external function handles the complexity.
 
-                sources_used['local_sources'].append({
-                    'query': query,
-                    'source_type': 'PDF Documents',
-                    'timestamp': time.time(),
-                    'filenames': extracted_files
-                })
-                sources_used['local_files_used'].extend(extracted_files)
+        class SourceTrackingLocalBookQA:
+            def __init__(self, fn_to_wrap):
+                self.fn_to_wrap = fn_to_wrap
+            
+            # This wrapper handles the new complex JSON output structure from local_book_qa_function
+            def __call__(self, query: str) -> str:
+                # The wrapped function returns a JSON string: {"text": "...", "local_files": [...], "images": [...]}
+                result_json_str = self.fn_to_wrap(query) 
                 
-                # Append source filenames to the response text for the agent's context
-                if extracted_files:
-                    local_response_text += f"\n\nLocal Sources: {', '.join(extracted_files)}"
-                return local_response_text
+                try:
+                    result_dict = json.loads(result_json_str)
+                    
+                    local_response_text = result_dict.get('text', 'No text response.')
+                    extracted_files = result_dict.get('local_files', [])
+                    images = result_dict.get('images', [])
+
+                    # Log and track sources for external analysis
+                    sources_used['local_sources'].append({
+                        'query': query,
+                        'source_type': 'PDF Documents',
+                        'timestamp': time.time(),
+                        'filenames': extracted_files
+                    })
+                    sources_used['local_files_used'].extend(extracted_files)
+                    sources_used['image_links'].extend(images) # Collect image links here
+
+                    # Format the response for the Agent's context (keep it simple text + files for LLM's reasoning)
+                    formatted_agent_response = local_response_text
+                    if extracted_files:
+                        formatted_agent_response += f"\n\nLocal Sources: {', '.join(extracted_files)}"
+                    
+                    # NOTE: We DO NOT expose the full JSON or image URLs to the Agent's scratchpad, 
+                    # as that is for the final output. The Agent only sees the text.
+                    return formatted_agent_response
+                except Exception as e:
+                    logger.error(f"Error parsing local_book_qa function output: {e}", exc_info=True)
+                    return f"Error processing local RAG result for query: {query}"
+
 
         class SourceTrackingWebSearch:
             def __init__(self, search_tool):
@@ -1067,13 +1108,15 @@ async def process_model_context_query(
                 
                 return result_text # Agent expects a string
 
+
         # Create dynamically wrapped tools based on which tools are active for this query
         enhanced_tools = []
         for tool in tools_for_agent:
             if tool.metadata.name == "local_book_qa":
-                enhanced_local_qa = SourceTrackingLocalBookQA(local_query_engine)
+                # Need to pass the original local_book_qa_function which returns JSON string
+                wrapped_fn = SourceTrackingLocalBookQA(local_book_qa_function)
                 enhanced_tool = FunctionTool.from_defaults(
-                    fn=enhanced_local_qa,
+                    fn=wrapped_fn, # Wrap the original function
                     name="local_book_qa",
                     description=tool.metadata.description
                 )
@@ -1095,65 +1138,56 @@ async def process_model_context_query(
             max_iterations=30
         )
 
+        response_data = {} # Common structure for all strategies
+        
         # Execute the selected RAG strategy
-        if selected_rag_strategy == "planning_workflow" or selected_rag_strategy == "rac_enhanced_hybrid_rag":
-            original_response_text = await run_planning_workflow(processed_question, agent_instance_for_query, response_trace)
-            tool_outputs.append({"tool": "planning_workflow", "result": original_response_text})
+        if selected_rag_strategy in ["planning_workflow", "rac_enhanced_hybrid_rag", "no_method"]:
+            # These strategies use the ReActAgent.chat which returns a text string.
+            agent_response_obj = await asyncio.to_thread(agent_instance_for_query.chat, processed_question)
+            original_response_text = agent_response_obj.response
+            response_data = {
+                'response': original_response_text,
+                'links': sources_used['web_links_used'], # Collected by wrapper
+                'local_files': sources_used['local_files_used'], # Collected by wrapper
+                'images': sources_used['image_links'] # Collected by wrapper
+            }
+            tool_outputs.append({"tool": selected_rag_strategy, "result": original_response_text})
+            response_trace.append(f"Agent raw response: '{original_response_text}'")
+
         elif selected_rag_strategy == "multi_step_query_engine":
-            # For multi_step, `run_multi_step_query_engine_workflow` returns text, web links, and local files.
-            original_response_text, links_from_msqe, files_from_msqe = await run_multi_step_query_engine_workflow(
+            original_response_text, links_from_msqe, files_from_msqe, images_from_msqe = await run_multi_step_query_engine_workflow(
                 processed_question, local_query_engine, google_custom_search_instance, response_trace, enhanced_tools
             )
+            response_data = {
+                'response': original_response_text,
+                'links': links_from_msqe,
+                'local_files': files_from_msqe,
+                'images': images_from_msqe
+            }
             tool_outputs.append({"tool": "multi_step_query_engine", "result": original_response_text})
-            # Add links and local files collected by multi-step query engine
+            # Add sources collected by multi-step query engine
             sources_used['web_links_used'].extend(links_from_msqe)
             sources_used['local_files_used'].extend(files_from_msqe)
-            if links_from_msqe:
-                sources_used['web_sources'].append({
-                    'query': processed_question,
-                    'source_type': 'Web Search (Multi-Step QE)',
-                    'timestamp': time.time()
-                })
-            if files_from_msqe:
-                sources_used['local_sources'].append({
-                    'query': processed_question,
-                    'source_type': 'PDF Documents (Multi-Step QE)',
-                    'timestamp': time.time(),
-                    'filenames': files_from_msqe
-                })
+            sources_used['image_links'].extend(images_from_msqe)
+        
         elif selected_rag_strategy == "multi_strategy_workflow":
-            # For multi_strategy, `run_multi_strategy_workflow` returns a dict with 'response', 'links', and 'local_files'.
             response_data = await run_multi_strategy_workflow(
                 processed_question, local_query_engine, google_custom_search_instance, response_trace, enhanced_tools
             )
             original_response_text = response_data['response']
             tool_outputs.append({"tool": "multi_strategy_workflow", "result": original_response_text})
-            # Links and local files are explicitly returned by run_multi_strategy_workflow
+            # Links, files, and images are explicitly returned by run_multi_strategy_workflow
             sources_used['web_links_used'].extend(response_data['links'])
             sources_used['local_files_used'].extend(response_data['local_files'])
-            if response_data['links']:
-                sources_used['web_sources'].append({
-                    'query': processed_question,
-                    'source_type': 'Web Search (Multi-Strategy)',
-                    'timestamp': time.time()
-                })
-            if response_data['local_files']:
-                 sources_used['local_sources'].append({
-                     'query': processed_question,
-                     'source_type': 'PDF Documents (Multi-Strategy)',
-                     'timestamp': time.time(),
-                     'filenames': response_data['local_files']
-                 })
-        elif selected_rag_strategy == "no_method":
-            # If no specific RAG strategy, the agent just chats.
-            # Source tracking happens via the `SourceTracking` wrappers if tools are used by the agent.
-            agent_response_obj = await asyncio.to_thread(agent_instance_for_query.chat, processed_question)
-            original_response_text = agent_response_obj.response
-            tool_outputs.append({"tool": "react_agent", "result": original_response_text})
-            response_trace.append(f"Agent raw response: '{original_response_text}'")
+            sources_used['image_links'].extend(response_data['images'])
+
         else:
             original_response_text = "Invalid RAG strategy selected."
+            response_data = {'response': original_response_text, 'links': [], 'local_files': [], 'images': []}
             logger.error(original_response_text)
+
+        final_response_data = response_data # Store the full response data structure
+        original_response_text = final_response_data['response'] # Extract the text response
 
         end_rag_strategy = time.perf_counter()
         response_trace.append(f"Timing - RAG Strategy ({selected_rag_strategy}) Execution: {end_rag_strategy - start_rag_strategy:.4f} seconds")
@@ -1222,12 +1256,16 @@ async def process_model_context_query(
         all_local_filenames = sources_used['local_files_used'] + rac_local_files
         unique_local_filenames = sorted(list(set(all_local_filenames))) # Ensure unique and sorted
         
+        # Combine image links from all strategies (RAC does not generate new images)
+        unique_image_links = []
+        seen_image_urls = set()
+        for img in sources_used['image_links']:
+            if img['url'] not in seen_image_urls:
+                unique_image_links.append(img)
+                seen_image_urls.add(img['url'])
+
+
         final_answer = final_answer_content
-        
-        # --- NEW: Image Detection Call ---
-        image_file_path = _detect_image_request(query)
-        response_trace.append(f"Image Detection Result: File Path detected: {image_file_path}")
-        # ---------------------------------
         
         end_total_process_mcp = time.perf_counter()
         response_trace.append(f"Timing - Total process_model_context_query duration: {end_total_process_mcp - start_total_process_mcp:.4f} seconds")
@@ -1241,12 +1279,10 @@ async def process_model_context_query(
                 "local_files": unique_local_filenames, # Pass unique filenames
                 "web_sources_count": len(sources_used['web_sources']), # Still count distinct web queries
                 "web_links": unique_web_sources,
-                "used_local": len(unique_local_filenames) > 0,
+                "image_links": unique_image_links, # NEW: Include unique image links
+                "used_local": len(unique_local_filenames) > 0 or len(unique_image_links) > 0,
                 "used_web": len(unique_web_sources) > 0
-            },
-            # --- NEW RETURN FIELD ---
-            "image_file_path": image_file_path
-            # ------------------------
+            }
         }
     except Exception as e:
         logger.error(f"Error in process_model_context_query: {e}", exc_info=True)
@@ -1264,12 +1300,10 @@ async def process_model_context_query(
                 "local_files": [],
                 "web_sources_count": 0,
                 "web_links": [],
+                "image_links": [],
                 "used_local": False,
                 "used_web": False
-            },
-            # --- NEW ERROR RETURN FIELD ---
-            "image_file_path": None
-            # ------------------------------
+            }
         }
 
 def main():
@@ -1299,11 +1333,13 @@ def main():
         # Configure the query engine to include source nodes
         local_query_engine = local_index.as_query_engine(
             llm=OPTIMAL_LLM,
-            # In older versions, 'response_mode' alone might not guarantee source nodes.
-            # However, 'tree_summarize' is a good bet for our purpose.
-            response_mode="tree_summarize",
+            # Important: The retriever must return source nodes for image/file extraction!
+            response_mode="tree_summarize", 
             similarity_top_k=5,
         )
+        # Also create a retriever instance for direct node retrieval
+        local_retriever = local_index.as_retriever(similarity_top_k=5)
+
         logger.info("Local PDF data indexed successfully.")
     except Exception as e:
         logger.critical(f"FATAL ERROR: Could not create VectorStoreIndex: {e}. Ensure Ollama models are running. Exiting.")
@@ -1335,27 +1371,60 @@ def main():
         query: str = Field(description="The question to ask about the PDF book content.")
 
     # Create LlamaIndex FunctionTool for local RAG
+    # MODIFIED: This function now returns a JSON string containing the text, files, and images.
     def local_book_qa_function(query: str) -> str:
-        """Function to expose local PDF querying to the LlamaIndex agent."""
+        """
+        Function to expose local PDF querying to the LlamaIndex agent.
+        Returns a JSON string containing the text response, local files, and image metadata.
+        """
         logger.info(f"Local RAG: Querying for '{query}'")
         start_local_rag_query = time.perf_counter()
-        response_obj = local_query_engine.query(query) # Get the Response object
+        
+        # 1. Retrieve nodes first (using the retriever)
+        nodes = local_retriever.retrieve(query)
+
+        # 2. Extract images/files from nodes
+        image_results = []
+        unique_filenames = set()
+        
+        for node in nodes:
+            # Add file to unique list
+            filename = node.metadata.get('filename')
+            if filename:
+                 unique_filenames.add(filename)
+
+            # --- NEW IMAGE LOGIC ADDITION ---
+            name = node.metadata.get("name")
+            caption = node.metadata.get("caption")
+            page = node.metadata.get("page")
+            if name and name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                image_results.append({
+                    "url": SUPABASE_URL + name,
+                    "caption": caption if caption else "Figure/Table from document",
+                    "page": page,
+                    "source_file": filename # Add source filename for traceability
+                })
+        
+        # 3. Use Query Engine to synthesize the text response
+        response_obj = local_query_engine.query(query) # This synthesizes the answer from the retrieved nodes
+        response_text = str(response_obj)
+
         end_local_rag_query = time.perf_counter()
         logger.info(f"Timing - Local RAG Query: {end_local_rag_query - start_local_rag_query:.4f} seconds")
         
-        response_text = str(response_obj)
-        extracted_files = _extract_source_filenames(response_obj)
-        
-        if extracted_files:
-            return f"{response_text}\n\nLocal Sources: {', '.join(extracted_files)}"
-        return response_text
+        # 4. Return packaged JSON string
+        return json.dumps({
+            "text": response_text,
+            "local_files": sorted(list(unique_filenames)),
+            "images": image_results
+        })
 
     local_rag_tool = FunctionTool.from_defaults(
         fn=local_book_qa_function,
         name="local_book_qa",
         description=(
             "Useful for questions specifically about the content of the provided PDF book. "
-            "The response will include the answer and the names of the local files it came from."
+            "The function returns a JSON string containing the text answer, source file names, and image URLs if figures/tables are relevant."
         ),
         fn_schema=LocalBookQAToolInput,
     )
@@ -1516,7 +1585,7 @@ def main():
                 query=user_question,
                 context_memory=context_memory, # Pass current chat context
                 tool_outputs=[], # Placeholder, populated internally by MCP
-                scratchpad="",   # Placeholder, populated internally by MCP
+                scratchpad="",    # Placeholder, populated internally by MCP
                 agent_instance=agent,
                 rac_corrector_instance=rac_corrector,
                 testing_mode=testing_mode_enabled,
@@ -1542,12 +1611,6 @@ def main():
             
             # Print the final answer
             print(mcp_response["final_answer"])
-            
-            # --- NEW: Print Image Status ---
-            image_path = mcp_response.get("image_file_path")
-            if image_path:
-                print(f"\n🖼️ **Image Generated:** The AI suggested an image. File path: {image_path}")
-            # -------------------------------
             
             # Display formatted sources information
             sources_info_str = format_sources_info(mcp_response["sources_used"])
@@ -1578,7 +1641,7 @@ def main():
 def format_sources_info(sources_info: Dict[str, Any]) -> str:
     """
     Formats the sources information into a user-friendly string for display.
-    Now includes specific local book names.
+    Now includes specific local book names and image links.
     """
     if not sources_info:
         return "\n📚 **Sources Used:** None"
@@ -1586,14 +1649,26 @@ def format_sources_info(sources_info: Dict[str, Any]) -> str:
     info_lines = ["\n📚 **Sources Used:**"]
     
     local_files = sources_info.get('local_files', [])
-    if sources_info.get('used_local', False) and local_files:
-        info_lines.append(f"  📄 **Local PDF Documents Referenced:**")
-        for i, filename in enumerate(local_files[:5], 1): # Limit to top 5 for brevity
-            info_lines.append(f"    {i}. {filename}")
-        if len(local_files) > 5:
-            info_lines.append(f"    ... and {len(local_files) - 5} more local files (not displayed)")
-    elif sources_info.get('used_local', False) and not local_files:
-        info_lines.append(f"  📄 Local PDF Documents: {sources_info['local_sources_count']} queries (no specific file names extracted)")
+    image_links = sources_info.get('image_links', []) # NEW
+
+    if sources_info.get('used_local', False):
+        if local_files:
+            info_lines.append(f"  📄 **Local PDF Documents Referenced:**")
+            for i, filename in enumerate(local_files[:5], 1): # Limit to top 5 for brevity
+                info_lines.append(f"    {i}. {filename}")
+            if len(local_files) > 5:
+                info_lines.append(f"    ... and {len(local_files) - 5} more local files (not displayed)")
+        
+        if image_links: # NEW: Display image links
+            info_lines.append(f"  🖼️ **Referenced Visual Aids/Images (Top 3):**")
+            for i, link in enumerate(image_links[:3], 1):
+                caption = link.get('caption', 'No caption available')
+                page_info = f" (Page: {link['page']})" if link.get('page') else ""
+                file_info = f" (Source: {link['source_file']})" if link.get('source_file') else ""
+                info_lines.append(f"    {i}. **{caption}**{page_info}{file_info}")
+                info_lines.append(f"       URL: {link['url']}")
+            if len(image_links) > 3:
+                info_lines.append(f"    ... and {len(image_links) - 3} more images (not displayed)")
 
     if sources_info.get('used_web', False):
         info_lines.append(f"  🌐 Web Search: {sources_info['web_sources_count']} queries")
@@ -1607,9 +1682,9 @@ def format_sources_info(sources_info: Dict[str, Any]) -> str:
                 snippet = link.get('snippet', '')
                 
                 info_lines.append(f"  {i}. **{title}**")
-                info_lines.append(f"      URL: {url}")
+                info_lines.append(f"       URL: {url}")
                 if snippet:
-                    info_lines.append(f"      Preview: {snippet}")
+                    info_lines.append(f"       Preview: {snippet}")
                 info_lines.append("") # Add a blank line for readability
             
             if len(web_links) > 5:

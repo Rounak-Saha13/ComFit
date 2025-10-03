@@ -2,6 +2,7 @@
 import os
 from .client import ChatEngine
 
+
 # Define the embed model path
 EMBED_MODEL_PATH = os.getenv("EMBED_MODEL_PATH", "./models/embedding-model")
 

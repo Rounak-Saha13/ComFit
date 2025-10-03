@@ -1,7 +1,10 @@
+"use client";
+
 import { useEffect, useRef } from "react";
 import renderMathInElement from "katex/contrib/auto-render";
 import "katex/dist/katex.min.css";
 import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw"; // 👈 allows raw HTML rendering
 
 interface Props {
   html: string;
@@ -10,10 +13,7 @@ interface Props {
 
 // Converts only [ ... ] blocks that begin with a LaTeX backslash (e.g., [ \frac{a}{b} ])
 function convertLatexBrackets(input: string) {
-  return input.replace(
-    /\[\s*\\(.+?)\s*\]/g,
-    (_, expr) => `$$\\${expr.trim()}$$`
-  );
+  return input.replace(/\[\s*\\(.+?)\s*\]/g, (_, expr) => `$$\\${expr.trim()}$$`);
 }
 
 export default function FormattedContent({ html, className = "" }: Props) {
@@ -37,16 +37,33 @@ export default function FormattedContent({ html, className = "" }: Props) {
     }
   }, [html]);
 
-  // Check if the content contains markdown patterns
-  const hasMarkdown = /[*_`#\[\]()!]/.test(html);
+  // Check if content has markdown or raw HTML patterns
+  const hasMarkdown = /[*_`#\[\]()!]/.test(html) || /<img|<a|<br/.test(html);
 
   if (hasMarkdown) {
-    // Use ReactMarkdown for content with markdown
     return (
       <div className={className}>
         <ReactMarkdown
+          rehypePlugins={[rehypeRaw]} // 👈 enable raw HTML passthrough
           components={{
-            // Custom styling for markdown elements
+            // 👇 Custom rendering overrides
+            img: ({ src, alt }) => (
+              <img
+                src={src || ""}
+                alt={alt || "image"}
+                className="rounded-lg my-2 max-w-full"
+              />
+            ),
+            a: ({ href, children }) => (
+              <a
+                href={href}
+                className="text-blue-600 hover:underline"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {children}
+              </a>
+            ),
             p: ({ children }) => <p className="mb-2">{children}</p>,
             h1: ({ children }) => (
               <h1 className="text-2xl font-bold mb-3">{children}</h1>
@@ -96,16 +113,6 @@ export default function FormattedContent({ html, className = "" }: Props) {
               </ol>
             ),
             li: ({ children }) => <li className="mb-1">{children}</li>,
-            a: ({ href, children }) => (
-              <a
-                href={href}
-                className="text-blue-600 hover:underline"
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {children}
-              </a>
-            ),
           }}
         >
           {html}
@@ -114,6 +121,6 @@ export default function FormattedContent({ html, className = "" }: Props) {
     );
   }
 
-  // Fall back to original HTML rendering for non-markdown content
+  // Fallback: render raw HTML directly (non-markdown content)
   return <div ref={containerRef} className={className} />;
 }
